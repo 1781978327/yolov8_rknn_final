@@ -36,10 +36,6 @@
 #include "im2d.h"
 #include "rga.h"
 
-// BYTetrack 跟踪器
-#include "BYTETracker.h"
-#include "STrack.h"
-
 // RTSP 推流相关
 #ifdef USE_RTSP_MPP
 #include "rtsp_mpp_sender.h"
@@ -87,9 +83,7 @@ std::atomic<int> g_latest_frame_slot(-1);  // g_latest_frame 对应的 slot，�
 // 跟踪器相关
 std::atomic<bool> g_tracker_enabled(false);  // 0=关闭, 1=开启
 std::mutex g_tracker_mutex;
-std::vector<BYTETracker*> g_trackers;  // 每个 slot 一个跟踪器
-std::atomic<long long> g_tracker_frame_id(0);
-std::vector<std::vector<STrack>> g_tracker_results;  // 每个 slot 的跟踪结果
+std::vector<std::vector<TrackerResultItem>> g_tracker_results;  // 每个 slot 的跟踪结果
 
 // RTSP 推流
 #ifdef USE_RTSP_MPP
@@ -334,6 +328,8 @@ bool unload_model_runtime(std::string* msg_out = nullptr) {
         g_model_loading = false;
         g_model_error.clear();
     }
+    rknn_lite::reset_shared_deepsort_trackers();
+    rknn_lite::reset_shared_bytetrack_trackers();
     {
         std::lock_guard<std::mutex> lock(g_tracker_mutex);
         for (auto& tracks : g_tracker_results) {
@@ -505,99 +501,64 @@ void start_video_reader(const std::string& path, bool loop) {
     }
 }
 
-// 获取跟踪ID对应的颜色（需要外部持有 g_tracker_mutex）
-cv::Scalar get_tracker_color(int slot_idx, int track_id) {
-    if (!g_trackers.empty() && slot_idx >= 0 && slot_idx < (int)g_trackers.size() && g_trackers[slot_idx]) {
-        return g_trackers[slot_idx]->get_color(track_id);
-    }
-    return cv::Scalar(0, 255, 0);
-}
-
 // 绘制带跟踪的检测框（需要外部持有 g_tracker_mutex）
-// 注意：coords 参数已废弃，tlbr 坐标已经是原始图像尺寸
-void draw_tracker_boxes(cv::Mat& img, const std::vector<STrack>& stracks, int slot_idx, 
-                        cv::Size coords = cv::Size(640, 640), cv::Size img_size = cv::Size(640, 640)) {
-    // 调试信息
+void draw_tracker_boxes(cv::Mat& img, const std::vector<TrackerResultItem>& tracks, int slot_idx) {
     static int debug_counter = 0;
-    bool print_debug = (debug_counter++ % 300 == 0);  // 降低日志频率，避免 1080p 模式下日志拖慢主循环
+    bool print_debug = (debug_counter++ % 300 == 0);
     if (print_debug) {
-        printf("[DEBUG draw] 收到 %zu 个跟踪结果, 图像尺寸: %dx%d\n", stracks.size(), img.cols, img.rows);
+        printf("[DEBUG draw] 收到 %zu 个跟踪结果, 图像尺寸: %dx%d, slot=%d\n",
+               tracks.size(), img.cols, img.rows, slot_idx);
     }
-    
+
     char text[256];
-    int max_boxes = 20;  // 最多显示 20 个框
+    int max_boxes = 20;
     int box_count = 0;
-    int drawn_count = 0;
-    for (const auto& st : stracks) {
-        // 只显示已激活且跟踪时间足够的框（过滤掉临时检测框）
-        if (!st.is_activated) continue;
-        if (st.track_id < 0) continue;  // 跳过无效ID
-        
+    for (const auto& track : tracks) {
+        if (!track.active || track.track_id < 0) continue;
+
         box_count++;
         if (box_count > max_boxes) break;
-        
-        // tlbr 坐标已经是原始图像尺寸，直接使用
-        int x1 = (int)(st.tlbr[0]);
-        int y1 = (int)(st.tlbr[1]);
-        int x2 = (int)(st.tlbr[2]);
-        int y2 = (int)(st.tlbr[3]);
-        
-        // 确保坐标在图像范围内
-        if (x1 < 0) x1 = 0;
-        if (y1 < 0) y1 = 0;
-        if (x2 > img.cols) x2 = img.cols;
-        if (y2 > img.rows) y2 = img.rows;
-        
+
+        int x1 = std::max(0, std::min((int)track.x1, img.cols - 1));
+        int y1 = std::max(0, std::min((int)track.y1, img.rows - 1));
+        int x2 = std::max(0, std::min((int)track.x2, img.cols - 1));
+        int y2 = std::max(0, std::min((int)track.y2, img.rows - 1));
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        const char* label = (track.label >= 0 && track.label < (int)coco_labels.size())
+                            ? coco_labels[track.label].c_str() : "unknown";
         if (print_debug) {
             printf("[DEBUG draw]   绘制 ID=%d %s 框: (%d,%d)-(%d,%d)\n",
-                   st.track_id, coco_labels[st.label].c_str(), x1, y1, x2, y2);
+                   track.track_id, label, x1, y1, x2, y2);
         }
-        
-        // 获取跟踪颜色（假设已持有锁）
-        cv::Scalar color = get_tracker_color(slot_idx, st.track_id);
-        
-        // 绘制跟踪框
+
+        cv::Scalar color = tracker_color_from_id(track.track_id);
         cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
-        
-        // 绘制标签（包含跟踪ID）
-        const char* label = (st.label >= 0 && st.label < (int)coco_labels.size())
-                            ? coco_labels[st.label].c_str() : "unknown";
-        snprintf(text, sizeof(text), "ID:%d %s %.1f%%", st.track_id, label, st.score * 100);
-        
+
+        snprintf(text, sizeof(text), "ID:%d %s %.1f%%", track.track_id, label, track.score * 100.0f);
         int baseLine = 0;
         cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-        
-        int x = x1;
-        int y = y1 - label_size.height - baseLine;
-        if (y < 0) y = 0;
-        if (x + label_size.width > img.cols) x = img.cols - label_size.width;
-        
-        // 绘制背景
-        cv::rectangle(img, cv::Rect(cv::Point(x, y), 
-                      cv::Size(label_size.width, label_size.height + baseLine)), 
+
+        int tx = x1;
+        int ty = y1 - label_size.height - baseLine;
+        if (ty < 0) ty = 0;
+        if (tx + label_size.width > img.cols) tx = img.cols - label_size.width;
+
+        cv::rectangle(img, cv::Rect(cv::Point(tx, ty),
+                      cv::Size(label_size.width, label_size.height + baseLine)),
                       color, -1);
-        
-        // 绘制文字
-        cv::putText(img, text, cv::Point(x, y + label_size.height), 
+        cv::putText(img, text, cv::Point(tx, ty + label_size.height),
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-        
-        // 绘制轨迹（只显示最近 20 个点，避免画面太乱）
-        const auto& traj = st.get_trajectory();
-        int max_traj_len = 20;
-        int start_idx = (traj.size() > max_traj_len) ? (traj.size() - max_traj_len) : 0;
-        for (size_t j = start_idx + 1; j < traj.size(); j++) {
-            int px1 = (int)(traj[j-1].first);
-            int py1 = (int)(traj[j-1].second);
-            int px2 = (int)(traj[j].first);
-            int py2 = (int)(traj[j].second);
-            // 确保坐标在图像范围内
-            px1 = std::max(0, std::min(px1, img.cols));
-            py1 = std::max(0, std::min(py1, img.rows));
-            px2 = std::max(0, std::min(px2, img.cols));
-            py2 = std::max(0, std::min(py2, img.rows));
+
+        const auto& traj = track.trajectory;
+        int start_idx = (traj.size() > 20) ? ((int)traj.size() - 20) : 0;
+        for (size_t j = (size_t)start_idx + 1; j < traj.size(); j++) {
+            int px1 = std::max(0, std::min((int)traj[j - 1].first, img.cols - 1));
+            int py1 = std::max(0, std::min((int)traj[j - 1].second, img.rows - 1));
+            int px2 = std::max(0, std::min((int)traj[j].first, img.cols - 1));
+            int py2 = std::max(0, std::min((int)traj[j].second, img.rows - 1));
             cv::line(img, cv::Point(px1, py1), cv::Point(px2, py2), color, 1);
         }
-        drawn_count++;
     }
 }
 
@@ -816,6 +777,9 @@ void handle_client(int client_fd) {
         std::string model_path;
         std::string label_path;
         std::string model_error;
+        std::string tracker_backend = rknn_lite::get_tracker_backend_name();
+        std::string tracker_reid_model = rknn_lite::resolve_tracker_reid_model();
+        int tracker_skip_frames = rknn_lite::get_deepsort_skip_frames();
         {
             std::lock_guard<std::mutex> lock(g_model_mutex);
             model_path = g_model_path;
@@ -842,6 +806,9 @@ void handle_client(int client_fd) {
         oss << "\"fps_cam0\":" << g_cam0_fps.load() << ",";
         oss << "\"fps_cam1\":" << g_cam1_fps.load() << ",";
         oss << "\"tracker_enabled\":" << (g_tracker_enabled ? "true" : "false") << ",";
+        oss << "\"tracker_backend\":\"" << json_escape(tracker_backend) << "\",";
+        oss << "\"tracker_reid_model\":\"" << json_escape(tracker_reid_model) << "\",";
+        oss << "\"tracker_skip_frames\":" << tracker_skip_frames << ",";
         oss << "\"detection_count_cam0\":" << g_cam0_detection_count.load() << ",";
         oss << "\"detection_count_cam1\":" << g_cam1_detection_count.load() << ",";
         oss << "\"threshold\":" << rknn_lite::get_detection_threshold() << ",";
@@ -913,7 +880,7 @@ void handle_client(int client_fd) {
         if (available && !frame_copy.empty()) {
             // 如果启用了跟踪，可选二次绘制（仅用于调试）。默认关闭，避免叠加双框。
             if (want_tracker && force_redraw) {
-                std::vector<STrack> tracks_for_frame;
+                std::vector<TrackerResultItem> tracks_for_frame;
                 {
                     std::lock_guard<std::mutex> lock(g_tracker_mutex);
                     if (frame_slot >= 0 && frame_slot < (int)g_tracker_results.size()) {
@@ -921,9 +888,7 @@ void handle_client(int client_fd) {
                     }
                 }
                 if (!tracks_for_frame.empty()) {
-                    cv::Size img_size = frame_copy.size();
-                    draw_tracker_boxes(frame_copy, tracks_for_frame, frame_slot,
-                                     cv::Size(g_model_width, g_model_height), img_size);
+                    draw_tracker_boxes(frame_copy, tracks_for_frame, frame_slot);
                 }
 
                 static int redraw_log_counter = 0;
@@ -949,7 +914,8 @@ void handle_client(int client_fd) {
     else if (route == "/api/tracker" && method == "GET") {
         // 获取/设置跟踪状态
         send_response(client_fd, build_json_response("success", 
-            std::string("跟踪状态: ") + (g_tracker_enabled ? "开启" : "关闭")), "application/json");
+            std::string("跟踪状态: ") + (g_tracker_enabled ? "开启" : "关闭") +
+            ", 算法: " + rknn_lite::get_tracker_backend_name()), "application/json");
     }
     else if (route.find("/api/tracker/") == 0 && method == "POST") {
         // /api/tracker/0 关闭跟踪 /api/tracker/1 开启跟踪
@@ -979,8 +945,46 @@ void handle_client(int client_fd) {
         std::string requested_model = parse_query_param(path, "model");
         bool has_labels_param = path.find("labels=") != std::string::npos;
         std::string requested_labels = parse_query_param(path, "labels");
+        bool has_tracker_param = path.find("tracker=") != std::string::npos;
+        std::string requested_tracker = has_tracker_param
+            ? parse_query_param(path, "tracker")
+            : rknn_lite::get_tracker_backend_name();
+        TrackerBackend requested_backend;
+        if (!parse_tracker_backend_name(requested_tracker, &requested_backend)) {
+            send_response(client_fd,
+                build_json_response("error", "无效的 tracker 参数，支持 bytetrack 或 deepsort"),
+                "application/json", 400);
+            return;
+        }
+        bool has_reid_param = (path.find("reid_model=") != std::string::npos) ||
+                              (path.find("reid=") != std::string::npos);
+        std::string requested_reid = parse_query_param(path, "reid_model");
+        if (requested_reid.empty() && path.find("reid=") != std::string::npos) {
+            requested_reid = parse_query_param(path, "reid");
+        }
+        bool has_tracker_skip_param = (path.find("tracker_skip=") != std::string::npos) ||
+                                      (path.find("deepsort_skip=") != std::string::npos);
+        std::string requested_skip_text = parse_query_param(path, "tracker_skip");
+        if (requested_skip_text.empty() && path.find("deepsort_skip=") != std::string::npos) {
+            requested_skip_text = parse_query_param(path, "deepsort_skip");
+        }
+        int requested_skip_frames = rknn_lite::get_deepsort_skip_frames();
+        if (has_tracker_skip_param) {
+            char* endptr = nullptr;
+            long parsed = strtol(requested_skip_text.c_str(), &endptr, 10);
+            if (requested_skip_text.empty() || endptr == requested_skip_text.c_str() || *endptr != '\0' || parsed < 0) {
+                send_response(client_fd,
+                    build_json_response("error", "无效的 tracker_skip 参数，必须是大于等于 0 的整数"),
+                    "application/json", 400);
+                return;
+            }
+            requested_skip_frames = (int)parsed;
+        }
         if (requested_labels == "default" || requested_labels == "DEFAULT") {
             requested_labels.clear();
+        }
+        if (requested_reid == "default" || requested_reid == "DEFAULT") {
+            requested_reid.clear();
         }
         if (!requested_model.empty() && !file_exists(requested_model)) {
             send_response(client_fd,
@@ -994,10 +998,33 @@ void handle_client(int client_fd) {
                 "application/json", 400);
             return;
         }
+        if (has_reid_param && !requested_reid.empty() && !file_exists(requested_reid)) {
+            send_response(client_fd,
+                build_json_response("error", "DeepSORT ReID 模型不存在或不可读: " + requested_reid),
+                "application/json", 400);
+            return;
+        }
+        if (requested_backend == TrackerBackend::DeepSort) {
+            std::string resolved_reid = has_reid_param ? requested_reid : rknn_lite::resolve_tracker_reid_model();
+            if (resolved_reid.empty()) {
+                send_response(client_fd,
+                    build_json_response("error", "未找到可用的 DeepSORT ReID 模型，请传入 reid_model 参数"),
+                    "application/json", 400);
+                return;
+            }
+            if (!file_exists(resolved_reid)) {
+                send_response(client_fd,
+                    build_json_response("error", "DeepSORT ReID 模型不存在或不可读: " + resolved_reid),
+                    "application/json", 400);
+                return;
+            }
+        }
 
-        if (!requested_model.empty() || has_labels_param) {
+        if (!requested_model.empty() || has_labels_param || has_tracker_param || has_reid_param || has_tracker_skip_param) {
             std::string current_model;
             std::string current_labels;
+            std::string current_tracker;
+            std::string current_reid;
             bool loaded = false;
             {
                 std::lock_guard<std::mutex> lock(g_model_mutex);
@@ -1005,14 +1032,20 @@ void handle_client(int client_fd) {
                 current_model = g_model_path;
                 current_labels = g_label_path;
             }
+            current_tracker = rknn_lite::get_tracker_backend_name();
+            current_reid = rknn_lite::get_tracker_reid_model_override();
+            int current_skip = rknn_lite::get_deepsort_skip_frames();
 
             bool model_changed = (!requested_model.empty() && requested_model != current_model);
             bool labels_changed = (has_labels_param && requested_labels != current_labels);
+            bool tracker_changed = (has_tracker_param && requested_tracker != current_tracker);
+            bool reid_changed = (has_reid_param && requested_reid != current_reid);
+            bool skip_changed = (has_tracker_skip_param && requested_skip_frames != current_skip);
 
-            if (loaded && (model_changed || labels_changed)) {
+            if (loaded && (model_changed || labels_changed || tracker_changed || reid_changed)) {
                 if (g_inference_enabled.load()) {
                     send_response(client_fd,
-                        build_json_response("error", "请先调用 /api/inference/off 关闭推理后再切换模型/标签"),
+                        build_json_response("error", "请先调用 /api/inference/off 关闭推理后再切换模型/标签/跟踪算法"),
                         "application/json", 409);
                     return;
                 }
@@ -1032,6 +1065,15 @@ void handle_client(int client_fd) {
                     g_label_path = requested_labels;
                 }
                 g_model_error.clear();
+            }
+            if (tracker_changed) {
+                rknn_lite::set_tracker_backend(requested_tracker);
+            }
+            if (reid_changed) {
+                rknn_lite::set_tracker_reid_model_override(requested_reid);
+            }
+            if (skip_changed) {
+                rknn_lite::set_deepsort_skip_frames(requested_skip_frames);
             }
         }
 
@@ -1054,6 +1096,9 @@ void handle_client(int client_fd) {
 
         std::string active_model;
         std::string active_labels;
+        std::string active_tracker = rknn_lite::get_tracker_backend_name();
+        std::string active_reid = rknn_lite::resolve_tracker_reid_model();
+        int active_skip_frames = rknn_lite::get_deepsort_skip_frames();
         {
             std::lock_guard<std::mutex> lock(g_model_mutex);
             active_model = g_model_path;
@@ -1062,14 +1107,20 @@ void handle_client(int client_fd) {
 
         g_inference_enabled = true;
         g_tracker_enabled = enable_tracker;
-        printf("[Inference] 推理已开启, 跟踪: %s, 模型: %s, 标签: %s\n",
+        printf("[Inference] 推理已开启, 跟踪: %s, 算法: %s, skip=%d, 模型: %s, 标签: %s, ReID: %s\n",
                enable_tracker ? "开启" : "关闭",
+               active_tracker.c_str(),
+               active_skip_frames,
                active_model.c_str(),
-               active_labels.c_str());
+               active_labels.c_str(),
+               active_reid.empty() ? "(none)" : active_reid.c_str());
         send_response(client_fd, build_json_response("success", 
             std::string("推理已开启, 跟踪: ") + (enable_tracker ? "开启" : "关闭") +
+            ", 算法: " + active_tracker +
+            ", skip: " + std::to_string(active_skip_frames) +
             ", 模型: " + active_model +
-            ", 标签: " + active_labels), "application/json");
+            ", 标签: " + active_labels +
+            (active_tracker == "deepsort" ? ", ReID: " + active_reid : "")), "application/json");
     }
     else if (route == "/api/inference/off" && method == "POST") {
         bool unload_requested =
@@ -1459,12 +1510,22 @@ int main(int argc, char** argv) {
     // 读取 RTSP 环境变量（可选）
     const char* env_rtsp_host = getenv("RTSP_HOST");
     const char* env_rtsp_port = getenv("RTSP_PORT");
+    const char* env_tracker_backend = getenv("TRACKER_BACKEND");
+    const char* env_tracker_reid = getenv("TRACKER_REID_MODEL");
     if (env_rtsp_host && *env_rtsp_host) {
         g_rtsp_host = env_rtsp_host;
     }
     if (env_rtsp_port && *env_rtsp_port) {
         int p = atoi(env_rtsp_port);
         if (p > 0 && p <= 65535) g_rtsp_port = p;
+    }
+    if (env_tracker_backend && *env_tracker_backend) {
+        if (!rknn_lite::set_tracker_backend(env_tracker_backend)) {
+            printf("[Tracker] 警告: 无效的 TRACKER_BACKEND=%s，继续使用默认 bytetrack\n", env_tracker_backend);
+        }
+    }
+    if (env_tracker_reid && *env_tracker_reid) {
+        rknn_lite::set_tracker_reid_model_override(env_tracker_reid);
     }
 
     // 解析命令行参数
@@ -1479,6 +1540,12 @@ int main(int argc, char** argv) {
             if (p > 0 && p <= 65535) {
                 g_rtsp_port = p;
             }
+        } else if (arg == "--tracker-backend" && i + 1 < argc) {
+            if (!rknn_lite::set_tracker_backend(argv[++i])) {
+                printf("[Tracker] 警告: 无效的 --tracker-backend，继续使用默认 bytetrack\n");
+            }
+        } else if (arg == "--reid-model" && i + 1 < argc) {
+            rknn_lite::set_tracker_reid_model_override(argv[++i]);
         }
     }
 
@@ -1486,6 +1553,9 @@ int main(int argc, char** argv) {
     print_banner();
     printf("[RTSP] 推流目标: %s | %s | %s\n",
            g_rtsp_url_0.c_str(), g_rtsp_url_1.c_str(), g_rtsp_url_video.c_str());
+    printf("[Tracker] 默认算法: %s | ReID: %s\n",
+           rknn_lite::get_tracker_backend_name().c_str(),
+           rknn_lite::resolve_tracker_reid_model().empty() ? "(none)" : rknn_lite::resolve_tracker_reid_model().c_str());
     
     // 初始化 slot 容器，模型在 /api/inference/on 时懒加载
     int total_slots = SLOTS_PER_CAM * 2;
@@ -1802,8 +1872,10 @@ int main(int argc, char** argv) {
             bool do_inference = g_inference_enabled.load();
             bool use_tracker = do_inference ? g_tracker_enabled.load() : false;
             int cam_id = (i < 3) ? 0 : 1;  // Slot 0-2 是摄像头0, Slot 3-5 是摄像头1
+            int tracker_stream_id = g_video_mode.load() ? 2 : cam_id;
             try {
-                std::thread([i, &slot_states, worker, do_inference, use_tracker, cam_id, img_size]() {
+                std::thread([i, &slot_states, worker, do_inference, use_tracker, cam_id, tracker_stream_id, img_size]() {
+                worker->set_tracker_stream_id(tracker_stream_id);
                 worker->set_use_tracker(use_tracker);
                 int ret = 0;
                 if (do_inference) {
@@ -1903,6 +1975,8 @@ int main(int argc, char** argv) {
         g_model_loaded = false;
         g_model_loading = false;
     }
+    rknn_lite::reset_shared_deepsort_trackers();
+    rknn_lite::reset_shared_bytetrack_trackers();
     if (cap0.isOpened()) cap0.release();
     if (cap1.isOpened()) cap1.release();
 

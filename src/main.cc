@@ -63,9 +63,25 @@ int main(int argc, char **argv)
     printf("  CV_HEARTBEAT_SEC  心跳间隔秒数, 默认 10\n");
     printf("  CV_HEADLESS    1=后台无界面(imshow/窗口关闭), 0=开启预览\n");
     printf("  TRACK_TRAIL_SECONDS 轨迹保留秒数, 默认 4 (需配合 ENABLE_TRACKER=1 使用)\n");
+    printf("  TRACKER_BACKEND 跟踪算法: bytetrack(默认) / deepsort\n");
+    printf("  TRACKER_REID_MODEL DeepSORT ReID 模型路径，未设置时自动找 osnet_x0_25_market.rknn\n");
     return -1;
   }
   model_name = (char *)argv[1]; // 参数一，模型所在路径
+
+  const char* env_tracker_backend = getenv("TRACKER_BACKEND");
+  const char* env_tracker_reid = getenv("TRACKER_REID_MODEL");
+  if (env_tracker_backend && *env_tracker_backend) {
+    if (!rknn_lite::set_tracker_backend(env_tracker_backend)) {
+      printf("警告: 无效的 TRACKER_BACKEND=%s，将继续使用默认 bytetrack\n", env_tracker_backend);
+    }
+  }
+  if (env_tracker_reid && *env_tracker_reid) {
+    rknn_lite::set_tracker_reid_model_override(env_tracker_reid);
+  }
+  printf("跟踪算法: %s | ReID: %s\n",
+         rknn_lite::get_tracker_backend_name().c_str(),
+         rknn_lite::resolve_tracker_reid_model().empty() ? "(none)" : rknn_lite::resolve_tracker_reid_model().c_str());
 
   // 启动算法上报心跳（后台线程），不会阻塞主循环
   algo_reporter::Config hb_cfg = algo_reporter::load_config_from_env();
@@ -295,12 +311,14 @@ int main(int argc, char **argv)
       cv::Mat frame;
       if (!cap.read(frame)) { printf("Cam0 无法读取初始帧\n"); return -1; }
       frame.copyTo(rkpool[i]->ori_img);
+      rkpool[i]->set_tracker_stream_id(0);
       slots[i] = pool.submit(&rknn_lite::interf, rkpool[i]);
     }
     for (int i = 3; i < 6; i++) {
       cv::Mat frame;
       if (!cap1.read(frame)) { printf("Cam1 无法读取初始帧\n"); return -1; }
       frame.copyTo(rkpool[i]->ori_img);
+      rkpool[i]->set_tracker_stream_id(1);
       slots[i] = pool.submit(&rknn_lite::interf, rkpool[i]);
     }
     int frames0 = 3, frames1 = 3;
@@ -343,6 +361,7 @@ int main(int argc, char **argv)
             preview_right_det = rkpool[i]->ori_img.clone();
 #endif
           frame.copyTo(rkpool[i]->ori_img);
+          rkpool[i]->set_tracker_stream_id(cam);
           slots[i] = pool.submit(&rknn_lite::interf, rkpool[i]);
           if (cam == 0) frames0++; else frames1++;
         }
@@ -403,6 +422,7 @@ dual_done:
         return -1;
       }
       frame.copyTo(ptr->ori_img);
+      ptr->set_tracker_stream_id(2);
       futs.push(pool.submit(&rknn_lite::interf, &(*ptr)));
     }
     while (true) {
@@ -427,6 +447,7 @@ dual_done:
         break;
       }
       frame.copyTo(rkpool[frames % n]->ori_img);
+      rkpool[frames % n]->set_tracker_stream_id(2);
       futs.push(pool.submit(&rknn_lite::interf, &(*rkpool[frames++ % n])));
 
       // 每 2 秒打印一次平均 FPS

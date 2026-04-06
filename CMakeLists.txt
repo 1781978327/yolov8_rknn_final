@@ -153,11 +153,30 @@ target_include_directories(bytetrack PRIVATE
 target_link_libraries(bytetrack ${OpenCV_LIBS})
 
 # =====================================================================
+# 5.1 DeepSORT 跟踪算法库
+# =====================================================================
+set(DEEPSORT_DIR ${CMAKE_SOURCE_DIR}/deepsort)
+aux_source_directory(${DEEPSORT_DIR}/src DEEPSORT_SRC)
+add_library(deepsort STATIC ${DEEPSORT_SRC})
+target_include_directories(deepsort PRIVATE
+    ${DEEPSORT_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(deepsort
+    ${RKNN_RT_LIB}
+    ${RGA_LIB}
+    ${OpenCV_LIBS}
+)
+
+# =====================================================================
 # 6. 主程序构建
 # =====================================================================
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/bytetrack/include
+    ${CMAKE_SOURCE_DIR}/deepsort/include
 )
 
 add_executable(rknn_yolov8_demo
@@ -177,6 +196,7 @@ if(OpenCV_FOUND)
     opencv_core opencv_highgui opencv_imgproc opencv_videoio opencv_imgcodecs
     ${RTSP_MPP_LIBS}
     bytetrack
+    deepsort
   )
 else()
   target_link_libraries(rknn_yolov8_demo
@@ -184,6 +204,7 @@ else()
     ${RGA_LIB}
     ${OpenCV_LIBS}
     ${RTSP_MPP_LIBS}
+    deepsort
   )
 endif()
 
@@ -226,6 +247,7 @@ target_include_directories(rknn_http_ctrl PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/deepsort/include
 )
 
 target_link_libraries(rknn_http_ctrl
@@ -235,6 +257,7 @@ target_link_libraries(rknn_http_ctrl
     ${RTSP_MPP_LIBS}
     pthread
     bytetrack
+    deepsort
 )
 
 # =====================================================================

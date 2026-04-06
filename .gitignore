@@ -32,6 +32,7 @@
 
 *.mp4
 /build
+/build_release
 /build_new
 /build_test
 /install
