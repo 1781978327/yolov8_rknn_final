@@ -1,0 +1,46 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+*.mp4
+/build
+/build_new
+/build_test
+/install
+
+# Local tooling and generated artifacts
+/.codex
+/frame.jpg
+/-d
+/-H
+/test_ffmpeg
+/test_ffmpeg_bin
+/test_video_read

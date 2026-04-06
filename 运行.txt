@@ -1,0 +1,3 @@
+ cd /home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15 && export LD_LIBRARY_PATH=./build/lib:$LD_LIBRARY_PATH && ./build/rknn_yolov8_demo   ./model/RK3588/yolov8s.rknn   0,2   rtsp://127.0.0.1:8554/cam0,rtsp://127.0.0.1:8554/cam1 2>&1
+
+ ./build/rknn_yolov8_demo ./model/RK3588/yolov8n.rknn 0 rtsp://0.0.0.0:8554/cam0
