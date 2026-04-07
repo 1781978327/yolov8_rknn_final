@@ -239,6 +239,9 @@ endif()
 # =====================================================================
 set(HTTP_CTRL_SOURCES
     src/main_http_ctrl.cc
+    src/http_ctrl_camera_io.cpp
+    src/http_ctrl_raw_video_rtsp.cpp
+    src/http_ctrl_web_utils.cpp
     src/postprocess.cc
     src/rk_common.cc
     src/v4l2_dmabuf_capture.cpp
