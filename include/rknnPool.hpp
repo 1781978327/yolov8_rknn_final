@@ -732,7 +732,7 @@ bool rknn_lite::prepare_camera_dmabuf_input(int fd, int width, int height,
 
     external_input_mem_ready_ = true;
     int log_idx = g_preprocess_camera_iomem_log_counter.fetch_add(1) + 1;
-    if ((log_idx % 120) == 0) {
+    if ((log_idx % 300) == 0) {
         printf("[Preprocess] camera dmabuf -> RGA -> input_mem (fd=%d, %dx%d, stride=%dx%d -> %dx%d)\n",
                fd, width, height, wstride, hstride, dst_w, dst_h);
     }
@@ -904,7 +904,7 @@ bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
     }
 
     int log_idx = g_preprocess_video_iomem_log_counter.fetch_add(1) + 1;
-    if ((log_idx % 120) == 0) {
+    if ((log_idx % 300) == 0) {
         printf("[Preprocess] video drm_fd -> RGA -> input_mem (fd=%d, %dx%d, stride=%dx%d -> %dx%d)\n",
                video_dmabuf_frame_.fd,
                video_dmabuf_frame_.width, video_dmabuf_frame_.height,
@@ -1695,7 +1695,7 @@ int rknn_lite::interf_detect_only() {
     }
 
     int dbg = infer_debug_counter.fetch_add(1) + 1;
-    if ((dbg % 180) == 0) {
+    if ((dbg % 600) == 0) {
         printf("[Draw infer] det=%d, draw_det=%d, draw_track=%d, backend=%s, use_tracker=%d\n",
                od_results.count, drawn_det_boxes, drawn_tracker_boxes,
                tracker_backend_to_string(tracker_backend_).c_str(), use_tracker_this_frame_ ? 1 : 0);

@@ -1531,7 +1531,7 @@ void handle_client(int client_fd) {
                 }
             } else if (want_tracker && !force_redraw) {
                 static int skip_redraw_log_counter = 0;
-                if ((skip_redraw_log_counter++ % 120) == 0) {
+                if ((skip_redraw_log_counter++ % 600) == 0) {
                     printf("[FrameAPI] 跳过二次绘制（避免双框）。如需调试叠加，请使用 /api/frame?track=1&redraw=1\n");
                 }
             }
@@ -2457,7 +2457,7 @@ int main(int argc, char** argv) {
                         // 注意：interf_detect_only() 已在 ori_img 上绘制跟踪框
                         // 这里若再次绘制会导致 RTSP 上出现“一人双框”
                         static int rtsp_skip_redraw_log_counter = 0;
-                        if ((rtsp_skip_redraw_log_counter++ % 300) == 0) {
+                        if ((rtsp_skip_redraw_log_counter++ % 1000) == 0) {
                             printf("[RTSP] 跳过二次绘制（避免双框）\n");
                         }
                     }

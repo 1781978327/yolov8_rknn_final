@@ -609,7 +609,7 @@ bool RtspMppSender::push(cv::Mat& bgr_frame) {
                                         (int)ctx->width, (int)ctx->height);
         if (ret == 0) {
             ctx->bgr_fd_push_count++;
-            if (ctx->bgr_fd_push_count == 1 || (ctx->bgr_fd_push_count % 120) == 0) {
+            if (ctx->bgr_fd_push_count == 1 || (ctx->bgr_fd_push_count % 600) == 0) {
                 std::cout << "[RTSP-DMA] BGR frame -> dma-bgr -> RGA -> NV12 -> MPP encoder"
                           << " frame=" << ctx->bgr_fd_push_count
                           << " size=" << ctx->width << "x" << ctx->height
