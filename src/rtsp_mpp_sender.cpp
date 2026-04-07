@@ -5,6 +5,9 @@
 #include "rtsp_mpp_sender.h"
 #include "command_mpp.h"
 #include "ffmpeg_with_mpp.h"
+#include "im2d.h"
+#include "im2d.hpp"
+#include "rga.h"
 #include <opencv2/imgproc.hpp>
 #include <libdrm/drm_fourcc.h>
 #include <rockchip/rk_mpi.h>
@@ -45,6 +48,10 @@ struct MppRtspContext {
     MppBufferInfo info;
     MppBuffer buffer = nullptr;
     MppBuffer commitBuffer = nullptr;
+    MppBuffer bgrStageBuffer = nullptr;
+    int bgrStageFd = -1;
+    void* bgrStagePtr = nullptr;
+    size_t bgrStageSize = 0;
     MppFrame mppframe = nullptr;
     MppPacket mppPacket = nullptr;
     MppApi* mppApi = nullptr;
@@ -57,6 +64,7 @@ struct MppRtspContext {
     unsigned int prep_hor_stride = 0;
     unsigned int prep_ver_stride = 0;
     unsigned int dmabuf_push_count = 0;
+    unsigned int bgr_fd_push_count = 0;
     Command cmd;
 };
 
@@ -402,6 +410,87 @@ static MPP_RET convert_cvframe_to_drm(MppRtspContext* ctx, cv::Mat& cvframe, Com
                             ctx->image_size);
 }
 
+static bool ensure_bgr_stage(MppRtspContext* ctx) {
+    if (!ctx) return false;
+    const size_t stage_size = (size_t)ctx->width * ctx->height * 3;
+    if (ctx->bgrStageBuffer && ctx->bgrStageFd >= 0 && ctx->bgrStagePtr && ctx->bgrStageSize == stage_size) {
+        return true;
+    }
+    if (ctx->bgrStageBuffer) {
+        mpp_buffer_put(ctx->bgrStageBuffer);
+        ctx->bgrStageBuffer = nullptr;
+        ctx->bgrStageFd = -1;
+        ctx->bgrStagePtr = nullptr;
+        ctx->bgrStageSize = 0;
+    }
+
+    MPP_RET ret = mpp_buffer_get(nullptr, &ctx->bgrStageBuffer, stage_size);
+    if (ret != MPP_OK || !ctx->bgrStageBuffer) {
+        ctx->bgrStageBuffer = nullptr;
+        return false;
+    }
+    ctx->bgrStageFd = mpp_buffer_get_fd(ctx->bgrStageBuffer);
+    ctx->bgrStagePtr = mpp_buffer_get_ptr(ctx->bgrStageBuffer);
+    ctx->bgrStageSize = stage_size;
+    if (ctx->bgrStageFd < 0 || !ctx->bgrStagePtr) {
+        mpp_buffer_put(ctx->bgrStageBuffer);
+        ctx->bgrStageBuffer = nullptr;
+        ctx->bgrStageFd = -1;
+        ctx->bgrStagePtr = nullptr;
+        ctx->bgrStageSize = 0;
+        return false;
+    }
+    return true;
+}
+
+static int transfer_bgr_fd_frame(MppRtspContext* ctx, int fd,
+                                 int width, int height, int wstride, int hstride) {
+    if (!ctx || fd < 0 || width <= 0 || height <= 0) return -1;
+    if ((unsigned int)width != ctx->width || (unsigned int)height != ctx->height) return -1;
+
+    MPP_RET res = mpp_buffer_get(nullptr, &ctx->buffer, ctx->image_size);
+    if (res != MPP_OK) return -1;
+
+    ctx->info.fd = mpp_buffer_get_fd(ctx->buffer);
+    ctx->info.ptr = mpp_buffer_get_ptr(ctx->buffer);
+    ctx->info.index = ctx->framecount;
+    ctx->info.size = ctx->image_size;
+    ctx->info.type = MPP_BUFFER_TYPE_DRM;
+
+    rga_buffer_t src = wrapbuffer_fd(fd, width, height, RK_FORMAT_BGR_888,
+                                     wstride > 0 ? wstride : width,
+                                     hstride > 0 ? hstride : height);
+    rga_buffer_t dst = wrapbuffer_fd(ctx->info.fd, ctx->width, ctx->height,
+                                     RK_FORMAT_YCbCr_420_SP, ctx->hor_stride, ctx->ver_stride);
+
+    IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_BGR_888, RK_FORMAT_YCbCr_420_SP);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
+        return -1;
+    }
+
+    res = mpp_buffer_commit(ctx->group, &ctx->info);
+    if (res != MPP_OK) {
+        if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
+        return -1;
+    }
+    res = mpp_buffer_get(ctx->group, &ctx->commitBuffer, ctx->image_size);
+    if (res != MPP_OK) {
+        if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
+        return -1;
+    }
+
+    int ret = (encode_mpp_frame(ctx, ctx->commitBuffer, MPP_FMT_YUV420SP,
+                                ctx->width, ctx->height,
+                                ctx->hor_stride, ctx->ver_stride,
+                                ctx->image_size) == MPP_OK) ? 0 : -1;
+    if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
+    if (ctx->commitBuffer) { mpp_buffer_put(ctx->commitBuffer); ctx->commitBuffer = nullptr; }
+    mpp_buffer_group_clear(ctx->group);
+    mpp_frame_deinit(&ctx->mppframe);
+    return ret;
+}
+
 static int transfer_frame(MppRtspContext* ctx, cv::Mat& cvframe, Command& obj) {
     MPP_RET rc = convert_cvframe_to_drm(ctx, cvframe, obj);
     if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
@@ -445,6 +534,13 @@ static void context_destroy(MppRtspContext* ctx) {
         if (ctx->group) {
             mpp_buffer_group_put(ctx->group);
             ctx->group = nullptr;
+        }
+        if (ctx->bgrStageBuffer) {
+            mpp_buffer_put(ctx->bgrStageBuffer);
+            ctx->bgrStageBuffer = nullptr;
+            ctx->bgrStageFd = -1;
+            ctx->bgrStagePtr = nullptr;
+            ctx->bgrStageSize = 0;
         }
         ctx->mpp_initialized = 0;
     }
@@ -501,19 +597,38 @@ bool RtspMppSender::push(cv::Mat& bgr_frame) {
     if (bgr_frame.empty() || bgr_frame.type() != CV_8UC3) return false;
     if (!inited_ || !ctx_) return false;
     MppRtspContext* ctx = (MppRtspContext*)ctx_;
+    if (ensure_bgr_stage(ctx)) {
+        cv::Mat stage_bgr((int)ctx->height, (int)ctx->width, CV_8UC3, ctx->bgrStagePtr, ctx->width * 3);
+        if (bgr_frame.cols != (int)ctx->width || bgr_frame.rows != (int)ctx->height) {
+            cv::resize(bgr_frame, stage_bgr, cv::Size(ctx->width, ctx->height));
+        } else {
+            bgr_frame.copyTo(stage_bgr);
+        }
+        int ret = transfer_bgr_fd_frame(ctx, ctx->bgrStageFd,
+                                        (int)ctx->width, (int)ctx->height,
+                                        (int)ctx->width, (int)ctx->height);
+        if (ret == 0) {
+            ctx->bgr_fd_push_count++;
+            if (ctx->bgr_fd_push_count == 1 || (ctx->bgr_fd_push_count % 120) == 0) {
+                std::cout << "[RTSP-DMA] BGR frame -> dma-bgr -> RGA -> NV12 -> MPP encoder"
+                          << " frame=" << ctx->bgr_fd_push_count
+                          << " size=" << ctx->width << "x" << ctx->height
+                          << " stage_fd=" << ctx->bgrStageFd << std::endl;
+            }
+            av_packet_unref(ctx->packet);
+            return true;
+        }
+    }
+
     if (bgr_frame.cols != (int)ctx->width || bgr_frame.rows != (int)ctx->height) {
         cv::Mat resized;
         cv::resize(bgr_frame, resized, cv::Size(ctx->width, ctx->height));
         bgr_frame = resized;
     }
-    // 与 rk_ffmpeg-main 示例保持完全一致：直接用 COLOR_RGB2YUV_YV12，
-    // OpenCV 默认输入是 BGR，这里故意保持同样的“错位”以得到一致的色彩效果。
     cv::Mat yuvframe;
     cv::cvtColor(bgr_frame, yuvframe, cv::COLOR_RGB2YUV_YV12);
     int ret = transfer_frame(ctx, yuvframe, ctx->cmd);
     if (ret != 0) {
-        // 推流链路出现错误（如 Broken pipe）时，及时销毁上下文，
-        // 让上层感知失败并触发重新初始化。
         destroy();
         return false;
     }

@@ -49,6 +49,8 @@ yolov8-rk3588-cpp-3-15/
   - 从 `AVDRMFrameDescriptor` 提取 `dma-buf fd`
   - `rkpool[i]->set_video_dmabuf_frame(...)`
   - `RGA -> RKNN input_mem`
+  - 推理 / 绘制后的 `BGR` 帧再回到 `dma-buf` staging
+  - `RGA -> NV12 -> MPP encoder -> RTSP`
 - 如果 `DRM_PRIME` 不可用，代码仍保留 `NV12` 与 `OpenCV/FFmpeg` 回退路径
 - `cam3` 现在支持两种工作方式：
   - 仅视频裸流：`/api/video/start` + `/api/rtsp/video/start`
@@ -60,7 +62,10 @@ yolov8-rk3588-cpp-3-15/
 - 摄像头推理前处理主链路已切为：
   - `camera dma-buf fd`
   - `RGA -> RKNN input_mem`
-- 摄像头显示 / 叠框 / RTSP 输出链仍保留 `cv::Mat(BGR)` 路径
+- 摄像头显示 / 叠框仍保留 `cv::Mat(BGR)` 路径
+- 摄像头 RTSP 推流主链路已切为：
+  - 推理 / 绘制后的 `BGR` 帧写回 `dma-buf` staging
+  - `RGA -> NV12 -> MPP encoder -> RTSP`
 - 若摄像头 `DMABUF` 不可用，代码仍会回退到 `OpenCV V4L2`
 
 最近一次本机回归结果：
@@ -71,6 +76,7 @@ yolov8-rk3588-cpp-3-15/
 - `main_http_ctrl` 视频推理日志可见 `frame_fmt=drm_prime(179) drm_valid=1`
 - 视频模式推理前处理日志可见 `video drm_fd -> RGA -> input_mem`
 - 摄像头模式推理前处理日志可见 `camera dmabuf -> RGA -> input_mem`
+- 推理后回 DMA 再推流日志可见 `RTSP-DMA] BGR frame -> dma-bgr -> RGA -> NV12 -> MPP encoder`
 
 ## 编译
 
@@ -235,10 +241,11 @@ curl -X POST $BASE/api/rtsp/video/start
 当前实现说明：
 
 - 视频文件模式下，worker 输入优先走 `DRM_PRIME dma-buf`
-- HTTP 预览和 RTSP 叠框显示仍保留 `cv::Mat(BGR)` 路径
+- HTTP 预览和叠框显示仍保留 `cv::Mat(BGR)` 路径
+- RTSP 推流编码前会优先把推理后的 `BGR` 帧写回 `dma-buf` staging，再由 `RGA + MPP` 推出
 - 因此同一帧会同时存在：
   - 一条用于推理的 `drm fd`
-  - 一条用于显示/推流预览的 `BGR Mat`
+  - 一条用于显示/叠框的 `BGR Mat`
 
 ## 跟踪器说明
 
@@ -297,6 +304,8 @@ curl "$BASE/api/frame?track=1&redraw=1" --output /tmp/frame_track.jpg
 
 注意：
 
+- `/api/frame` 只有在视频流或摄像头流已经启动并产生过当前帧时才会返回 JPEG
+- 在空闲态调用 `/api/frame` 会返回 `503` 与 `暂无帧数据`
 - `redraw=1` 是调试开关
 - 推理线程本身已经在 `ori_img` 上画过框
 - 使用 `redraw=1` 可能看到文字或框叠加
