@@ -645,22 +645,61 @@ bool file_exists(const std::string& path) {
     return !path.empty() && access(path.c_str(), R_OK) == 0;
 }
 
-bool read_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
-                       cv::VideoCapture* cv_cap,
-                       cv::Mat* frame_out) {
+struct CameraDmabufFrameInfo {
+    bool valid = false;
+    int index = -1;
+    int fd = -1;
+    void* va = nullptr;
+    int size = 0;
+    int width = 0;
+    int height = 0;
+    int wstride = 0;
+    int hstride = 0;
+    int rga_format = 0;
+};
+
+static void release_camera_dmabuf_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
+                                        CameraDmabufFrameInfo* frame_info) {
+    if (!frame_info) return;
+    if (dmabuf_cap && dmabuf_cap->fd >= 0 && dmabuf_cap->streaming &&
+        frame_info->valid && frame_info->index >= 0) {
+        (void)v4l2_dmabuf::queue_buffer(dmabuf_cap, frame_info->index);
+    }
+    *frame_info = CameraDmabufFrameInfo{};
+}
+
+static bool acquire_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
+                                 cv::VideoCapture* cv_cap,
+                                 cv::Mat* frame_out,
+                                 CameraDmabufFrameInfo* frame_info = nullptr) {
     if (!frame_out) return false;
     frame_out->release();
+    if (frame_info) {
+        *frame_info = CameraDmabufFrameInfo{};
+    }
 
     if (dmabuf_cap && dmabuf_cap->fd >= 0 && dmabuf_cap->streaming) {
         int index = -1;
         int ret = v4l2_dmabuf::dequeue_buffer(dmabuf_cap, 100, &index);
         if (ret == 1 && index >= 0 && index < (int)dmabuf_cap->buffers.size()) {
             auto& buffer = dmabuf_cap->buffers[index];
+            if (frame_info) {
+                frame_info->valid = true;
+                frame_info->index = index;
+                frame_info->fd = buffer.fd;
+                frame_info->va = buffer.va;
+                frame_info->size = (int)buffer.size;
+                frame_info->width = dmabuf_cap->width;
+                frame_info->height = dmabuf_cap->height;
+                frame_info->wstride = dmabuf_cap->wstride > 0 ? dmabuf_cap->wstride : dmabuf_cap->width;
+                frame_info->hstride = dmabuf_cap->hstride > 0 ? dmabuf_cap->hstride : dmabuf_cap->height;
+                frame_info->rga_format = RK_FORMAT_YUYV_422;
+            }
             if (buffer.va && dmabuf_cap->width > 0 && dmabuf_cap->height > 0) {
-                cv::Mat yuyv(dmabuf_cap->height, dmabuf_cap->width, CV_8UC2, buffer.va);
+                size_t step = (size_t)(dmabuf_cap->bytesperline > 0 ? dmabuf_cap->bytesperline : dmabuf_cap->width * 2);
+                cv::Mat yuyv(dmabuf_cap->height, dmabuf_cap->width, CV_8UC2, buffer.va, step);
                 cv::cvtColor(yuyv, *frame_out, cv::COLOR_YUV2BGR_YUYV);
             }
-            (void)v4l2_dmabuf::queue_buffer(dmabuf_cap, index);
             return !frame_out->empty();
         }
         return false;
@@ -671,6 +710,15 @@ bool read_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
     }
 
     return false;
+}
+
+bool read_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
+                       cv::VideoCapture* cv_cap,
+                       cv::Mat* frame_out) {
+    CameraDmabufFrameInfo frame_info;
+    bool ok = acquire_camera_frame(dmabuf_cap, cv_cap, frame_out, &frame_info);
+    release_camera_dmabuf_frame(dmabuf_cap, &frame_info);
+    return ok;
 }
 
 std::string parse_query_param(const std::string& path, const std::string& key) {
@@ -2458,8 +2506,19 @@ int main(int argc, char** argv) {
             if (slot_states[i].busy.load() || slot_states[i].ready.load()) continue;
 
             int cam = (i < SLOTS_PER_CAM) ? 0 : 1;
+            rknn_lite* worker = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(g_model_mutex);
+                if (i < (int)rkpool.size()) {
+                    worker = rkpool[i];
+                }
+            }
+            if (!worker) continue;
+
             cv::Mat frame;
             bool frame_ok = false;
+            bool do_inference = g_inference_enabled.load();
+            CameraDmabufFrameInfo camera_frame_info;
 
             // 检查是否是视频文件模式
             bool video_mode = g_video_mode.load();
@@ -2496,21 +2555,21 @@ int main(int argc, char** argv) {
                 }
             } else {
                 // 使用摄像头
-                frame_ok = (cam == 0)
-                    ? read_camera_frame(&dmabuf_cap0, &cap0, &frame)
-                    : read_camera_frame(&dmabuf_cap1, &cap1, &frame);
+                v4l2_dmabuf::CaptureContext* active_cap = (cam == 0) ? &dmabuf_cap0 : &dmabuf_cap1;
+                cv::VideoCapture* active_cv_cap = (cam == 0) ? &cap0 : &cap1;
+                frame_ok = acquire_camera_frame(active_cap, active_cv_cap, &frame, &camera_frame_info);
+                if (frame_ok && do_inference && camera_frame_info.valid) {
+                    (void)worker->prepare_camera_dmabuf_input(camera_frame_info.fd,
+                                                              camera_frame_info.width,
+                                                              camera_frame_info.height,
+                                                              camera_frame_info.wstride,
+                                                              camera_frame_info.hstride,
+                                                              camera_frame_info.rga_format);
+                }
+                release_camera_dmabuf_frame(active_cap, &camera_frame_info);
             }
 
             if (!frame_ok) continue;
-
-            rknn_lite* worker = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(g_model_mutex);
-                if (i < (int)rkpool.size()) {
-                    worker = rkpool[i];
-                }
-            }
-            if (!worker) continue;
 
             g_active_jobs.fetch_add(1);
             frame.copyTo(worker->ori_img);
@@ -2522,7 +2581,6 @@ int main(int argc, char** argv) {
             cv::Size img_size = frame.size();
             
             // 只在推理开启时才执行推理
-            bool do_inference = g_inference_enabled.load();
             bool use_tracker = do_inference ? g_tracker_enabled.load() : false;
             int cam_id = (i < 3) ? 0 : 1;  // Slot 0-2 是摄像头0, Slot 3-5 是摄像头1
             int tracker_stream_id = g_video_mode.load() ? 2 : cam_id;

@@ -54,12 +54,23 @@ yolov8-rk3588-cpp-3-15/
   - 仅视频裸流：`/api/video/start` + `/api/rtsp/video/start`
   - 视频推理流：在上面基础上再调用 `/api/inference/on`
 
+## 当前摄像头链路
+
+- 摄像头采集优先使用 `V4L2 DMABUF`
+- 摄像头推理前处理主链路已切为：
+  - `camera dma-buf fd`
+  - `RGA -> RKNN input_mem`
+- 摄像头显示 / 叠框 / RTSP 输出链仍保留 `cv::Mat(BGR)` 路径
+- 若摄像头 `DMABUF` 不可用，代码仍会回退到 `OpenCV V4L2`
+
 最近一次本机回归结果：
 
 - `cam0` / `cam1`：`h264 640x480 @ 30fps`
 - `cam3`：`h264 1920x1080 @ 25fps`
 - 本机 `ffprobe` / `ffmpeg` 均可直接拉流
 - `main_http_ctrl` 视频推理日志可见 `frame_fmt=drm_prime(179) drm_valid=1`
+- 视频模式推理前处理日志可见 `video drm_fd -> RGA -> input_mem`
+- 摄像头模式推理前处理日志可见 `camera dmabuf -> RGA -> input_mem`
 
 ## 编译
 
@@ -149,6 +160,8 @@ curl $BASE/api/status
 curl $BASE/api/video/status
 curl $BASE/api/tracker
 curl $BASE/api/threshold/get
+curl "$BASE/api/detection/count?cam=0"
+curl "$BASE/api/detection/count?cam=1"
 ```
 
 ### 开启摄像头模式
@@ -171,6 +184,13 @@ RTSP 地址：
 
 - `rtsp://127.0.0.1:8554/cam0`
 - `rtsp://127.0.0.1:8554/cam1`
+
+切换当前摄像头编号（仅切换状态字段，不会修改固定 RTSP 路由）：
+
+```bash
+curl -X POST $BASE/api/camera/0
+curl -X POST $BASE/api/camera/1
+```
 
 ### 开启视频文件模式
 
@@ -285,17 +305,29 @@ curl "$BASE/api/frame?track=1&redraw=1" --output /tmp/frame_track.jpg
 
 ```bash
 curl -X POST "$BASE/api/threshold/set?value=0.55"
+curl -X POST "$BASE/api/threshold/set?value=0.40"
+curl -X POST "$BASE/api/threshold/set?value=0.70"
+curl -X POST "$BASE/api/threshold/set?value=0.50"
 curl "$BASE/api/detection/count?cam=0"
 curl "$BASE/api/detection/count?cam=1"
 curl -X POST $BASE/api/tracker/1
 curl -X POST $BASE/api/tracker/0
 curl -X POST $BASE/api/camera/0
 curl -X POST $BASE/api/camera/1
+curl -X POST $BASE/api/camera/2
 curl -X POST $BASE/api/rtsp/stop
 curl -X POST "$BASE/api/inference/off"
 curl -X POST "$BASE/api/inference/off?unload=1"
 curl -X POST $BASE/api/video/stop
+curl $BASE/
 ```
+
+说明：
+
+- `/api/status` 会返回 `model_loaded`、`video_mode`、`rtsp_streaming`、`tracker_backend`、`tracker_skip_frames` 等完整状态
+- `/api/frame` 在空闲态会返回 `503` 与 `暂无帧数据`
+- `/api/threshold/set` 建议配合 `/api/threshold/get` 立即确认是否生效
+- `/api/camera/2` 当前会返回成功，但摄像头 RTSP 仍固定使用 `cam0=/dev/video0`、`cam1=/dev/video2`
 
 ## 用 ffplay / ffprobe 验证推流
 
@@ -331,6 +363,48 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/cam1
 
 - `cam3` 启动后如果立刻探测，首次偶发 `404` 属于发布路径尚未稳定，通常等待约 `1` 秒再探测即可
 - 视频 RTSP 当前仍可能出现 `non monotonically increasing dts` 警告，但不影响本机 `ffprobe` / `ffmpeg` 拉流与解码
+
+## API 回归建议
+
+建议按下面顺序做一次完整回归：
+
+```bash
+BASE=http://127.0.0.1:8091
+
+# 1. 只读接口
+curl $BASE/api/status
+curl $BASE/api/video/status
+curl $BASE/api/tracker
+curl $BASE/api/threshold/get
+curl "$BASE/api/detection/count?cam=0"
+curl "$BASE/api/detection/count?cam=1"
+
+# 2. 阈值接口
+curl -X POST "$BASE/api/threshold/set?value=0.4"
+curl $BASE/api/threshold/get
+curl -X POST "$BASE/api/threshold/set?value=0.5"
+curl $BASE/api/threshold/get
+
+# 3. 视频文件 + YOLO
+curl -X POST $BASE/api/rtsp/stop
+curl -X POST "$BASE/api/inference/off?unload=1"
+curl -X POST $BASE/api/video/stop
+curl -X POST $BASE/api/video/start \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/video/person.mp4","loop":true}'
+curl -X POST "$BASE/api/inference/on?track=0&model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn"
+curl -X POST $BASE/api/rtsp/video/start
+curl $BASE/api/status
+curl $BASE/api/video/status
+
+# 4. 摄像头 + 跟踪
+curl -X POST $BASE/api/rtsp/stop
+curl -X POST "$BASE/api/inference/off?unload=1"
+curl -X POST $BASE/api/video/stop
+curl -X POST "$BASE/api/inference/on?track=1&tracker=bytetrack&model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn"
+curl -X POST $BASE/api/rtsp/start
+curl "$BASE/api/frame?track=1&redraw=1" --output /tmp/frame_track.jpg
+```
 
 ## 用工具验证 DRM_PRIME
 

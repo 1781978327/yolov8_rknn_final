@@ -211,6 +211,7 @@ int open_capture(const CaptureConfig& config, CaptureContext* out, std::string* 
     const uint32_t fmt_width = mplane ? fmt.fmt.pix_mp.width : fmt.fmt.pix.width;
     const uint32_t fmt_height = mplane ? fmt.fmt.pix_mp.height : fmt.fmt.pix.height;
     const uint32_t fmt_sizeimage = mplane ? fmt.fmt.pix_mp.plane_fmt[0].sizeimage : fmt.fmt.pix.sizeimage;
+    const uint32_t fmt_bytesperline = mplane ? fmt.fmt.pix_mp.plane_fmt[0].bytesperline : fmt.fmt.pix.bytesperline;
     const size_t plane0_size = static_cast<size_t>(
         std::max<uint32_t>(fmt_sizeimage, static_cast<uint32_t>(fmt_width * fmt_height * 2)));
 
@@ -219,6 +220,9 @@ int open_capture(const CaptureConfig& config, CaptureContext* out, std::string* 
     out->mplane = mplane;
     out->width = static_cast<int>(fmt_width);
     out->height = static_cast<int>(fmt_height);
+    out->bytesperline = static_cast<int>(fmt_bytesperline > 0 ? fmt_bytesperline : fmt_width * 2);
+    out->wstride = out->bytesperline / 2;
+    out->hstride = out->height;
     out->pixfmt = actual_pixfmt;
     out->num_planes = mplane ? static_cast<int>(fmt.fmt.pix_mp.num_planes) : 1;
     out->plane0_size = plane0_size;

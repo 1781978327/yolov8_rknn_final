@@ -141,6 +141,7 @@ static int fps_frame_count = 0;
 static double fps_last_time = 0.0;
 static double current_fps = 0.0;
 static std::atomic<int> g_preprocess_rgb_iomem_log_counter(0);
+static std::atomic<int> g_preprocess_camera_iomem_log_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_log_counter(0);
 static std::atomic<int> g_preprocess_legacy_log_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_fail_counter(0);
@@ -270,6 +271,7 @@ private:
     bool last_tracker_feature_match_;  // 当前帧是否执行了特征匹配
     rknn_tensor_mem* input_mem_;  // RKNN input io_mem
     bool input_mem_ready_;  // 是否已启用 io_mem 输入
+    bool external_input_mem_ready_;  // 是否已由主线程预先完成 input_mem 前处理
     VideoDmabufFrame video_dmabuf_frame_;  // 视频模式 DRM PRIME 帧
     VideoRgbStageBuffer video_rgb_stage_buffer_;  // 视频模式 fd-backed RGA 中转 RGB 帧
     cv::Mat video_nv12_frame_;  // 视频模式 packed NV12 帧
@@ -308,6 +310,7 @@ public:
     static void reset_shared_deepsort_trackers();  // 重置共享 DeepSORT 状态
     static void reset_shared_bytetrack_trackers();  // 重置共享 ByteTrack 状态
     void set_tracker_stream_id(int stream_id);  // 设置当前worker所属的跟踪流
+    bool prepare_camera_dmabuf_input(int fd, int width, int height, int wstride, int hstride, int rga_format);
 
     int RGA_bgr_to_rgb(const cv::Mat& bgr_image, cv::Mat &rgb_image);
     int RGA_resize(const cv::Mat& src, cv::Mat& dst, int dst_width, int dst_height);
@@ -346,6 +349,7 @@ rknn_lite::rknn_lite(char* model_path, int core_id) {
     last_tracker_feature_match_ = true;
     input_mem_ = nullptr;
     input_mem_ready_ = false;
+    external_input_mem_ready_ = false;
     video_rgb_stage_buffer_ = VideoRgbStageBuffer{};
     video_nv12_valid_ = false;
     video_nv12_width_ = 0;
@@ -688,6 +692,51 @@ bool rknn_lite::upload_rgb_fd_to_input_mem(int fd, int width, int height, int ws
                            im_rect{0, 0, 0, 0}, IM_SYNC);
     }
     return status == IM_STATUS_SUCCESS || status == IM_STATUS_NOERROR;
+}
+
+bool rknn_lite::prepare_camera_dmabuf_input(int fd, int width, int height,
+                                            int wstride, int hstride, int rga_format) {
+    external_input_mem_ready_ = false;
+    if (!input_mem_ready_ || !input_mem_ || fd < 0 || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    const int dst_w = app_ctx.model_width;
+    const int dst_h = app_ctx.model_height;
+    const int dst_w_stride = app_ctx.input_attrs[0].w_stride > 0 ? (int)app_ctx.input_attrs[0].w_stride : dst_w;
+    const int dst_h_stride = app_ctx.input_attrs[0].h_stride > 0 ? (int)app_ctx.input_attrs[0].h_stride : dst_h;
+
+    rga_buffer_t src = wrapbuffer_fd(fd, width, height, rga_format,
+                                     wstride > 0 ? wstride : width,
+                                     hstride > 0 ? hstride : height);
+    rga_buffer_t dst;
+    if (input_mem_->fd > 0) {
+        dst = wrapbuffer_fd(input_mem_->fd, dst_w, dst_h, RK_FORMAT_RGB_888, dst_w_stride, dst_h_stride);
+    } else {
+        dst = wrapbuffer_virtualaddr(input_mem_->virt_addr, dst_w, dst_h, RK_FORMAT_RGB_888, dst_w_stride, dst_h_stride);
+    }
+
+    im_rect src_rect = {0, 0, width, height};
+    im_rect dst_rect = {0, 0, dst_w, dst_h};
+    int check = imcheck(src, dst, src_rect, dst_rect);
+    if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
+        return false;
+    }
+
+    IM_STATUS status = improcess(src, dst,
+                                 wrapbuffer_virtualaddr(nullptr, 0, 0, RK_FORMAT_RGBA_8888),
+                                 src_rect, dst_rect, im_rect{0, 0, 0, 0}, IM_SYNC);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        return false;
+    }
+
+    external_input_mem_ready_ = true;
+    int log_idx = g_preprocess_camera_iomem_log_counter.fetch_add(1) + 1;
+    if ((log_idx % 120) == 0) {
+        printf("[Preprocess] camera dmabuf -> RGA -> input_mem (fd=%d, %dx%d, stride=%dx%d -> %dx%d)\n",
+               fd, width, height, wstride, hstride, dst_w, dst_h);
+    }
+    return true;
 }
 
 void rknn_lite::release_video_rgb_stage_buffer() {
@@ -1229,6 +1278,10 @@ int rknn_lite::interf() {
 
     cv::Mat img;
     bool input_ready = false;
+    if (external_input_mem_ready_) {
+        input_ready = true;
+        external_input_mem_ready_ = false;
+    }
     if (video_dmabuf_frame_.valid) {
         input_ready = preprocess_video_dmabuf_to_input_mem();
         if (!input_ready) {
@@ -1535,6 +1588,10 @@ int rknn_lite::interf_detect_only() {
 
     cv::Mat img;
     bool input_ready = false;
+    if (external_input_mem_ready_) {
+        input_ready = true;
+        external_input_mem_ready_ = false;
+    }
     if (video_dmabuf_frame_.valid) {
         input_ready = preprocess_video_dmabuf_to_input_mem();
         if (!input_ready) {

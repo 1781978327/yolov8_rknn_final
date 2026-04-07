@@ -28,6 +28,9 @@ struct CaptureContext {
     bool streaming = false;
     int width = 0;
     int height = 0;
+    int wstride = 0;
+    int hstride = 0;
+    int bytesperline = 0;
     uint32_t pixfmt = 0;
     int buf_type = 0;
     bool mplane = false;
