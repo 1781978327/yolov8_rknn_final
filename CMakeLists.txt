@@ -131,10 +131,12 @@ if(FFMPEG_RKMPP_FOUND)
   include_directories(${FFMPEG_RKMPP_INCLUDE})
   link_directories(${FFMPEG_RKMPP_LIB})
   set(RTSP_MPP_SRCS src/rtsp_mpp_sender.cpp)
+  set(VIDEO_RKMPP_READER_SRCS src/ffmpeg_rkmpp_reader.cpp)
   set(RTSP_MPP_LIBS -lavformat -lavcodec -lavutil -lswscale -lswresample -lavdevice -lz -lpthread -llzma -lm -ldrm -lrockchip_mpp)
   set(RTSP_MPP_BUILD_RPATH "${FFMPEG_RKMPP_RPATH}")
 else()
   set(RTSP_MPP_SRCS "")
+  set(VIDEO_RKMPP_READER_SRCS "")
   set(RTSP_MPP_LIBS "")
   set(RTSP_MPP_BUILD_RPATH "")
 endif()
@@ -184,6 +186,7 @@ add_executable(rknn_yolov8_demo
   src/postprocess.cc
   src/rk_common.cc
   src/algo_reporter.cpp
+  src/v4l2_dmabuf_capture.cpp
   ${RTSP_MPP_SRCS}
 )
 
@@ -238,6 +241,8 @@ set(HTTP_CTRL_SOURCES
     src/main_http_ctrl.cc
     src/postprocess.cc
     src/rk_common.cc
+    src/v4l2_dmabuf_capture.cpp
+    ${VIDEO_RKMPP_READER_SRCS}
     ${RTSP_MPP_SRCS}
 )
 

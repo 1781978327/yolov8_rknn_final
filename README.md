@@ -41,6 +41,20 @@ yolov8-rk3588-cpp-3-15/
 - FFmpeg 60 + RKMPP
 - RTSP 服务器，例如 `mediamtx`
 
+## 当前视频链路
+
+- 视频文件输入已切回 `FFmpeg RKMPP 解码 + RGA 预处理`
+- 视频模式下不再依赖 `DRM_PRIME` 作为推理输入链路
+- `cam3` 现在支持两种工作方式：
+  - 仅视频裸流：`/api/video/start` + `/api/rtsp/video/start`
+  - 视频推理流：在上面基础上再调用 `/api/inference/on`
+
+最近一次本机回归结果：
+
+- `cam0` / `cam1`：`h264 640x480 @ 30fps`
+- `cam3`：`h264 1920x1080 @ 25fps`
+- 本机 `ffprobe` / `ffmpeg` 均可直接拉流
+
 ## 编译
 
 推荐使用 `Release` 构建：
@@ -170,7 +184,13 @@ curl -X POST $BASE/api/video/start \
   -d '{"path":"/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/video/person.mp4","loop":true}'
 ```
 
-启动推理：
+如果你只想推原视频裸流，不开推理，直接启动视频 RTSP：
+
+```bash
+curl -X POST $BASE/api/rtsp/video/start
+```
+
+如果要做视频推理，再启动推理：
 
 ```bash
 curl -X POST "$BASE/api/inference/on?track=1&tracker=deepsort&tracker_skip=2&model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn&reid_model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/osnet_x0_25_market.rknn"
@@ -268,16 +288,35 @@ curl -X POST $BASE/api/video/stop
 视频模式：
 
 ```bash
-ffprobe -rtsp_transport tcp rtsp://127.0.0.1:8554/cam3
+ffprobe -v error -rtsp_transport tcp \
+  -show_entries stream=codec_name,width,height,avg_frame_rate \
+  -of json rtsp://127.0.0.1:8554/cam3
+
+ffmpeg -v error -rtsp_transport tcp \
+  -i rtsp://127.0.0.1:8554/cam3 -t 3 -f null -
+
 ffplay  -rtsp_transport tcp -fflags nobuffer -flags low_delay rtsp://127.0.0.1:8554/cam3
 ```
 
 双摄模式：
 
 ```bash
+ffprobe -v error -rtsp_transport tcp \
+  -show_entries stream=codec_name,width,height,avg_frame_rate \
+  -of json rtsp://127.0.0.1:8554/cam0
+
+ffprobe -v error -rtsp_transport tcp \
+  -show_entries stream=codec_name,width,height,avg_frame_rate \
+  -of json rtsp://127.0.0.1:8554/cam1
+
 ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/cam0
 ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/cam1
 ```
+
+说明：
+
+- `cam3` 启动后如果立刻探测，首次偶发 `404` 属于发布路径尚未稳定，通常等待约 `1` 秒再探测即可
+- 视频 RTSP 当前仍可能出现 `non monotonically increasing dts` 警告，但不影响本机 `ffprobe` / `ffmpeg` 拉流与解码
 
 ## 命令行程序 `rknn_yolov8_demo`
 

@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <vector>
 #include <algorithm>
+#include <memory>
 
 // OpenCV
 #include <opencv2/core/core.hpp>
@@ -35,10 +36,12 @@
 #include "RgaUtils.h"
 #include "im2d.h"
 #include "rga.h"
+#include "v4l2_dmabuf_capture.h"
 
 // RTSP 推流相关
 #ifdef USE_RTSP_MPP
 #include "rtsp_mpp_sender.h"
+#include "ffmpeg_rkmpp_reader.h"
 #endif
 
 // ---------------------- 配置 ----------------------
@@ -108,10 +111,24 @@ void stop_rtsp_senders_locked() {
 #endif
 
 // 视频文件处理
+struct VideoFrameInfo {
+    bool nv12_valid = false;
+    cv::Mat nv12_packed;
+    int size = 0;
+    int width = 0;
+    int height = 0;
+    int wstride = 0;
+    int hstride = 0;
+};
+
 std::atomic<bool> g_video_mode(false);  // 是否为视频文件模式
 std::atomic<bool> g_video_loop(false);   // 是否循环播放视频
 std::string g_video_path;                 // 当前视频路径
 cv::VideoCapture g_video_cap;            // 视频捕获对象
+#ifdef USE_RTSP_MPP
+std::unique_ptr<FFmpegRkmppReader> g_video_hw_reader;
+std::atomic<bool> g_video_hw_enabled(false);
+#endif
 std::mutex g_video_mutex;
 std::queue<cv::Mat> g_video_frames;      // 视频帧队列
 std::condition_variable g_video_cv;
@@ -199,6 +216,34 @@ std::string json_escape(const std::string& input) {
 
 bool file_exists(const std::string& path) {
     return !path.empty() && access(path.c_str(), R_OK) == 0;
+}
+
+bool read_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
+                       cv::VideoCapture* cv_cap,
+                       cv::Mat* frame_out) {
+    if (!frame_out) return false;
+    frame_out->release();
+
+    if (dmabuf_cap && dmabuf_cap->fd >= 0 && dmabuf_cap->streaming) {
+        int index = -1;
+        int ret = v4l2_dmabuf::dequeue_buffer(dmabuf_cap, 100, &index);
+        if (ret == 1 && index >= 0 && index < (int)dmabuf_cap->buffers.size()) {
+            auto& buffer = dmabuf_cap->buffers[index];
+            if (buffer.va && dmabuf_cap->width > 0 && dmabuf_cap->height > 0) {
+                cv::Mat yuyv(dmabuf_cap->height, dmabuf_cap->width, CV_8UC2, buffer.va);
+                cv::cvtColor(yuyv, *frame_out, cv::COLOR_YUV2BGR_YUYV);
+            }
+            (void)v4l2_dmabuf::queue_buffer(dmabuf_cap, index);
+            return !frame_out->empty();
+        }
+        return false;
+    }
+
+    if (cv_cap && cv_cap->isOpened()) {
+        return cv_cap->read(*frame_out) && !frame_out->empty();
+    }
+
+    return false;
 }
 
 std::string parse_query_param(const std::string& path, const std::string& key) {
@@ -411,6 +456,122 @@ void clear_video_queue_locked() {
     }
 }
 
+bool open_video_source_locked() {
+#ifdef USE_RTSP_MPP
+    if (!g_video_hw_reader) {
+        g_video_hw_reader.reset(new FFmpegRkmppReader());
+    }
+    if (g_video_hw_reader->Open(g_video_path)) {
+        if (g_video_hw_reader->Width() > 0) g_video_width = g_video_hw_reader->Width();
+        if (g_video_hw_reader->Height() > 0) g_video_height = g_video_hw_reader->Height();
+        if (g_video_hw_reader->Fps() >= 1.0 && g_video_hw_reader->Fps() <= 120.0) {
+            g_video_fps = (int)(g_video_hw_reader->Fps() + 0.5);
+        }
+        g_video_hw_enabled = true;
+        printf("[Video] FFmpeg + RGA 已打开: %dx%d @ %.1f fps (decoder=%s)\n",
+               g_video_width.load(), g_video_height.load(), g_video_hw_reader->Fps(),
+               g_video_hw_reader->DecoderName().c_str());
+        return true;
+    }
+    if (g_video_hw_reader) {
+        g_video_hw_reader->Close();
+    }
+    g_video_hw_enabled = false;
+#endif
+
+    g_video_cap.open(g_video_path, cv::CAP_FFMPEG);
+    if (!g_video_cap.isOpened()) {
+        return false;
+    }
+
+    int vw = (int)g_video_cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int vh = (int)g_video_cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+    double vf = g_video_cap.get(cv::CAP_PROP_FPS);
+    if (vw > 0) g_video_width = vw;
+    if (vh > 0) g_video_height = vh;
+    if (vf >= 1.0 && vf <= 120.0) g_video_fps = (int)(vf + 0.5);
+    printf("[Video] OpenCV/FFmpeg 回退已打开: %dx%d @ %.1f fps\n", g_video_width.load(), g_video_height.load(), vf);
+    return true;
+}
+
+bool read_video_frame_locked(cv::Mat& frame, VideoFrameInfo* frame_info = nullptr) {
+    if (frame_info) {
+        *frame_info = VideoFrameInfo{};
+    }
+#ifdef USE_RTSP_MPP
+    if (g_video_hw_enabled.load() && g_video_hw_reader) {
+        FFmpegRkmppReader::FrameInfo reader_info;
+        FFmpegRkmppReader::FrameInfo* reader_info_ptr = frame_info ? &reader_info : nullptr;
+        auto copy_reader_info = [&]() {
+            if (!frame_info || !reader_info_ptr) return;
+            frame_info->nv12_valid = reader_info_ptr->nv12_valid;
+            frame_info->nv12_packed = reader_info_ptr->nv12_packed;
+            frame_info->size = reader_info_ptr->size;
+            frame_info->width = reader_info_ptr->width;
+            frame_info->height = reader_info_ptr->height;
+            frame_info->wstride = reader_info_ptr->wstride;
+            frame_info->hstride = reader_info_ptr->hstride;
+        };
+
+        if (g_video_hw_reader->ReadFrame(frame, reader_info_ptr) && !frame.empty()) {
+            copy_reader_info();
+            return true;
+        }
+        if (g_video_loop.load()) {
+            g_video_hw_reader->Close();
+            if (g_video_hw_reader->Open(g_video_path) && g_video_hw_reader->ReadFrame(frame, reader_info_ptr) && !frame.empty()) {
+                if (g_video_hw_reader->Width() > 0) g_video_width = g_video_hw_reader->Width();
+                if (g_video_hw_reader->Height() > 0) g_video_height = g_video_hw_reader->Height();
+                if (g_video_hw_reader->Fps() >= 1.0 && g_video_hw_reader->Fps() <= 120.0) {
+                    g_video_fps = (int)(g_video_hw_reader->Fps() + 0.5);
+                }
+                copy_reader_info();
+                return true;
+            }
+        }
+        g_video_hw_reader->Close();
+        g_video_hw_enabled = false;
+        return false;
+    }
+#endif
+
+    if (!g_video_cap.isOpened()) {
+        return false;
+    }
+    if (g_video_cap.read(frame) && !frame.empty()) {
+        return true;
+    }
+    if (g_video_loop.load()) {
+        g_video_cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+        return g_video_cap.read(frame) && !frame.empty();
+    }
+    return false;
+}
+
+bool ensure_video_source_open_locked() {
+    bool video_opened =
+#ifdef USE_RTSP_MPP
+        (g_video_hw_enabled.load() && g_video_hw_reader && g_video_hw_reader->IsOpen()) ||
+#endif
+        g_video_cap.isOpened();
+    if (video_opened) {
+        return true;
+    }
+    return open_video_source_locked();
+}
+
+void close_video_source_locked() {
+#ifdef USE_RTSP_MPP
+    if (g_video_hw_reader) {
+        g_video_hw_reader->Close();
+    }
+    g_video_hw_enabled = false;
+#endif
+    if (g_video_cap.isOpened()) {
+        g_video_cap.release();
+    }
+}
+
 void video_reader_loop() {
     const size_t kMaxQueuedFrames = 8;
 
@@ -424,33 +585,25 @@ void video_reader_loop() {
                 break;
             }
 
-            if (!g_video_cap.isOpened()) {
-                g_video_cap.open(g_video_path);
-                if (!g_video_cap.isOpened()) {
+            bool video_opened =
+#ifdef USE_RTSP_MPP
+                (g_video_hw_enabled.load() && g_video_hw_reader && g_video_hw_reader->IsOpen()) ||
+#endif
+                g_video_cap.isOpened();
+            if (!video_opened) {
+                if (!ensure_video_source_open_locked()) {
                     printf("[Video] 无法打开视频: %s\n", g_video_path.c_str());
                     g_video_running = false;
                     g_video_mode = false;
                     clear_video_queue_locked();
                     break;
                 }
-
-                int vw = (int)g_video_cap.get(cv::CAP_PROP_FRAME_WIDTH);
-                int vh = (int)g_video_cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-                double vf = g_video_cap.get(cv::CAP_PROP_FPS);
-                if (vw > 0) g_video_width = vw;
-                if (vh > 0) g_video_height = vh;
-                if (vf >= 1.0 && vf <= 120.0) g_video_fps = (int)(vf + 0.5);
-                printf("[Video] 已打开视频: %dx%d @ %.1f fps\n", g_video_width.load(), g_video_height.load(), vf);
             }
 
-            frame_ok = g_video_cap.read(frame);
-            if (!frame_ok && g_video_loop.load()) {
-                g_video_cap.set(cv::CAP_PROP_POS_FRAMES, 0);
-                frame_ok = g_video_cap.read(frame);
-            }
+            frame_ok = read_video_frame_locked(frame);
 
             if (!frame_ok) {
-                g_video_cap.release();
+                close_video_source_locked();
                 g_video_running = false;
                 g_video_mode = false;
                 clear_video_queue_locked();
@@ -476,9 +629,7 @@ void stop_video_reader() {
         g_video_running = false;
         g_video_mode = false;
         clear_video_queue_locked();
-        if (g_video_cap.isOpened()) {
-            g_video_cap.release();
-        }
+        close_video_source_locked();
     }
     g_video_cv.notify_all();
     if (g_video_thread.joinable()) {
@@ -1232,6 +1383,16 @@ void handle_client(int client_fd) {
             int vf = g_video_fps.load();
             {
                 std::lock_guard<std::mutex> video_lock(g_video_mutex);
+                if (g_video_running.load() && g_video_mode.load()) {
+                    (void)ensure_video_source_open_locked();
+                }
+#ifdef USE_RTSP_MPP
+                if (g_video_hw_enabled.load() && g_video_hw_reader && g_video_hw_reader->IsOpen()) {
+                    if (g_video_hw_reader->Width() > 0) vw = g_video_hw_reader->Width();
+                    if (g_video_hw_reader->Height() > 0) vh = g_video_hw_reader->Height();
+                    if (g_video_hw_reader->Fps() > 0) vf = (int)(g_video_hw_reader->Fps() + 0.5);
+                } else
+#endif
                 if (g_video_cap.isOpened()) {
                     int cap_w = (int)g_video_cap.get(cv::CAP_PROP_FRAME_WIDTH);
                     int cap_h = (int)g_video_cap.get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -1335,6 +1496,16 @@ void handle_client(int client_fd) {
         int vf = g_video_fps.load();
         {
             std::lock_guard<std::mutex> video_lock(g_video_mutex);
+            if (g_video_running.load() && g_video_mode.load()) {
+                (void)ensure_video_source_open_locked();
+            }
+#ifdef USE_RTSP_MPP
+            if (g_video_hw_enabled.load() && g_video_hw_reader && g_video_hw_reader->IsOpen()) {
+                if (g_video_hw_reader->Width() > 0) vw = g_video_hw_reader->Width();
+                if (g_video_hw_reader->Height() > 0) vh = g_video_hw_reader->Height();
+                if (g_video_hw_reader->Fps() > 0) vf = (int)(g_video_hw_reader->Fps() + 0.5);
+            } else
+#endif
             if (g_video_cap.isOpened()) {
                 int cap_w = (int)g_video_cap.get(cv::CAP_PROP_FRAME_WIDTH);
                 int cap_h = (int)g_video_cap.get(cv::CAP_PROP_FRAME_HEIGHT);
@@ -1565,26 +1736,56 @@ int main(int argc, char** argv) {
     }
     auto& rkpool = g_rkpool;
     
-    // 打开摄像头
-    cv::VideoCapture cap0(0, cv::CAP_V4L2);
-    cv::VideoCapture cap1(2, cv::CAP_V4L2);
-    
-    if (cap0.isOpened()) {
-        cap0.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap0.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-        cap0.set(cv::CAP_PROP_FPS, 30);
-        printf("[Capture] 摄像头0 已打开\n");
+    // 打开摄像头：优先 DMABUF，失败时回退到 OpenCV V4L2
+    v4l2_dmabuf::CaptureContext dmabuf_cap0;
+    v4l2_dmabuf::CaptureContext dmabuf_cap1;
+    cv::VideoCapture cap0;
+    cv::VideoCapture cap1;
+
+    v4l2_dmabuf::CaptureConfig cap0_cfg;
+    cap0_cfg.device_name = "/dev/video0";
+    cap0_cfg.width = 640;
+    cap0_cfg.height = 480;
+    cap0_cfg.fps = 30;
+    cap0_cfg.dma_buffers = 4;
+
+    std::string cap0_err;
+    if (v4l2_dmabuf::open_capture(cap0_cfg, &dmabuf_cap0, &cap0_err) == 0) {
+        printf("[Capture] 摄像头0 DMABUF 已打开: %s (%dx%d @ %dfps)\n",
+               cap0_cfg.device_name.c_str(), dmabuf_cap0.width, dmabuf_cap0.height, cap0_cfg.fps);
     } else {
-        printf("[Capture] 警告: 无法打开摄像头0\n");
+        cap0.open(0, cv::CAP_V4L2);
+        if (cap0.isOpened()) {
+            cap0.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cap0.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cap0.set(cv::CAP_PROP_FPS, 30);
+            printf("[Capture] 摄像头0 OpenCV 回退已打开 (DMABUF失败: %s)\n", cap0_err.c_str());
+        } else {
+            printf("[Capture] 警告: 无法打开摄像头0 (DMABUF失败: %s)\n", cap0_err.c_str());
+        }
     }
-    
-    if (cap1.isOpened()) {
-        cap1.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        cap1.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-        cap1.set(cv::CAP_PROP_FPS, 30);
-        printf("[Capture] 摄像头1 已打开\n");
+
+    v4l2_dmabuf::CaptureConfig cap1_cfg;
+    cap1_cfg.device_name = "/dev/video2";
+    cap1_cfg.width = 640;
+    cap1_cfg.height = 480;
+    cap1_cfg.fps = 30;
+    cap1_cfg.dma_buffers = 4;
+
+    std::string cap1_err;
+    if (v4l2_dmabuf::open_capture(cap1_cfg, &dmabuf_cap1, &cap1_err) == 0) {
+        printf("[Capture] 摄像头1 DMABUF 已打开: %s (%dx%d @ %dfps)\n",
+               cap1_cfg.device_name.c_str(), dmabuf_cap1.width, dmabuf_cap1.height, cap1_cfg.fps);
     } else {
-        printf("[Capture] 警告: 无法打开摄像头1\n");
+        cap1.open(2, cv::CAP_V4L2);
+        if (cap1.isOpened()) {
+            cap1.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+            cap1.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            cap1.set(cv::CAP_PROP_FPS, 30);
+            printf("[Capture] 摄像头1 OpenCV 回退已打开 (DMABUF失败: %s)\n", cap1_err.c_str());
+        } else {
+            printf("[Capture] 警告: 无法打开摄像头1 (DMABUF失败: %s)\n", cap1_err.c_str());
+        }
     }
     
     // 初始化 slot 状态
@@ -1618,13 +1819,79 @@ int main(int argc, char** argv) {
         }
         if (!g_model_loaded.load()) {
 #ifdef USE_RTSP_MPP
-            // 未加载模型时，仍允许摄像头 RTSP 裸流（不做推理）
+            // 未加载模型时，仍允许 RTSP 裸流（不做推理）
             if (g_rtsp_streaming.load()) {
+                if (g_video_mode.load()) {
+                    cv::Mat raw_video;
+                    bool got_frame = false;
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_video_mutex);
+                        if (g_video_running.load() && g_video_mode.load()) {
+                            if (!ensure_video_source_open_locked()) {
+                                printf("[Video] 无法打开视频: %s\n", g_video_path.c_str());
+                                g_video_running = false;
+                                g_video_mode = false;
+                            } else {
+                                got_frame = read_video_frame_locked(raw_video);
+                            }
+                        }
+
+                        if (!got_frame) {
+                            close_video_source_locked();
+                            g_video_running = false;
+                            g_video_mode = false;
+                            clear_video_queue_locked();
+                        }
+                    }
+
+                    if (got_frame && !raw_video.empty()) {
+                        frames0++;
+                        {
+                            std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
+                            g_latest_frame = raw_video.clone();
+                            g_frame_available = true;
+                            g_latest_frame_slot = 0;
+                        }
+                        {
+                            std::lock_guard<std::mutex> rtsp_lock(g_rtsp_mutex);
+                            if (g_rtsp_sender_video && g_rtsp_sender_video->inited()) {
+                                if (g_rtsp_sender_video->push(raw_video)) {
+                                    push0++;
+                                } else {
+                                    printf("[RTSP] 视频裸流写包失败，已自动停止\n");
+                                    g_rtsp_streaming = false;
+                                }
+                            }
+                        }
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+
+                    gettimeofday(&time_now, nullptr);
+                    long now_ms = time_now.tv_sec * 1000 + time_now.tv_usec / 1000;
+                    if (now_ms - last_fps_time_ms >= 1000) {
+                        float elapsed = (now_ms - last_fps_time_ms) / 1000.0f;
+                        g_cam0_fps.store((int)(frames0 / elapsed));
+                        g_cam1_fps.store(0);
+                        if (push0 > 0) {
+                            printf("[FPS-RAW-VIDEO] Video: %d FPS | RTSP: %d\n",
+                                   g_cam0_fps.load(), push0);
+                        }
+                        frames0 = 0;
+                        frames1 = 0;
+                        push0 = 0;
+                        push1 = 0;
+                        last_fps_time_ms = now_ms;
+                    }
+                    continue;
+                }
+
                 bool got_frame = false;
 
-                if (cap0.isOpened()) {
+                {
                     cv::Mat raw0;
-                    if (cap0.read(raw0) && !raw0.empty()) {
+                    if (read_camera_frame(&dmabuf_cap0, &cap0, &raw0) && !raw0.empty()) {
                         got_frame = true;
                         frames0++;
                         {
@@ -1647,9 +1914,9 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (cap1.isOpened()) {
+                {
                     cv::Mat raw1;
-                    if (cap1.read(raw1) && !raw1.empty()) {
+                    if (read_camera_frame(&dmabuf_cap1, &cap1, &raw1) && !raw1.empty()) {
                         got_frame = true;
                         frames1++;
                         {
@@ -1804,48 +2071,32 @@ int main(int argc, char** argv) {
             bool video_mode = g_video_mode.load();
             if (video_mode) {
                 std::lock_guard<std::mutex> lock(g_video_mutex);
-                if (g_video_cap.isOpened()) {
-                    if (g_video_cap.read(frame)) {
-                        frame_ok = true;
-                    } else if (g_video_loop.load()) {
-                        g_video_cap.set(cv::CAP_PROP_POS_FRAMES, 0);
-                        if (g_video_cap.read(frame)) {
-                            frame_ok = true;
-                        }
-                    }
-                    if (!frame_ok) {
-                        g_video_cap.release();
-                        g_video_running = false;
-                        g_video_mode = false;
-                        printf("[Video] 视频播放完毕\n");
-                    }
-                } else {
-                    g_video_cap.open(g_video_path);
-                    if (g_video_cap.isOpened()) {
-                        int vw = (int)g_video_cap.get(cv::CAP_PROP_FRAME_WIDTH);
-                        int vh = (int)g_video_cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-                        double vf = g_video_cap.get(cv::CAP_PROP_FPS);
-                        if (vw > 0) g_video_width = vw;
-                        if (vh > 0) g_video_height = vh;
-                        if (vf >= 1.0 && vf <= 120.0) g_video_fps = (int)(vf + 0.5);
-                        printf("[Video] 已打开视频: %dx%d @ %.1f fps\n", vw, vh, vf);
-                        if (g_video_cap.read(frame)) {
-                            frame_ok = true;
-                        }
-                    } else {
+                VideoFrameInfo video_frame_info;
+                if (!ensure_video_source_open_locked()) {
                         printf("[Video] 无法打开视频: %s\n", g_video_path.c_str());
                         g_video_running = false;
                         g_video_mode = false;
+                }
+                if (g_video_running.load() && g_video_mode.load()) {
+                    frame_ok = read_video_frame_locked(frame, &video_frame_info);
+                }
+                if (!frame_ok) {
+                    close_video_source_locked();
+                    g_video_running = false;
+                    g_video_mode = false;
+                    printf("[Video] 视频播放完毕\n");
+                } else if (video_frame_info.nv12_valid) {
+                    if (i >= 0 && i < (int)rkpool.size() && rkpool[i]) {
+                        rkpool[i]->set_video_nv12_frame(video_frame_info.nv12_packed,
+                                                        video_frame_info.width, video_frame_info.height,
+                                                        video_frame_info.wstride, video_frame_info.hstride);
                     }
                 }
             } else {
                 // 使用摄像头
-                cv::VideoCapture& cap = (cam == 0) ? cap0 : cap1;
-                if (cap.isOpened()) {
-                    if (cap.read(frame)) {
-                        frame_ok = true;
-                    }
-                }
+                frame_ok = (cam == 0)
+                    ? read_camera_frame(&dmabuf_cap0, &cap0, &frame)
+                    : read_camera_frame(&dmabuf_cap1, &cap1, &frame);
             }
 
             if (!frame_ok) continue;
@@ -1979,6 +2230,8 @@ int main(int argc, char** argv) {
     rknn_lite::reset_shared_bytetrack_trackers();
     if (cap0.isOpened()) cap0.release();
     if (cap1.isOpened()) cap1.release();
+    v4l2_dmabuf::close_capture(&dmabuf_cap0);
+    v4l2_dmabuf::close_capture(&dmabuf_cap1);
 
 #ifdef USE_RTSP_MPP
     {
