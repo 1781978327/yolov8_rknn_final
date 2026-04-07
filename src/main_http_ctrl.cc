@@ -28,6 +28,7 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <libdrm/drm_fourcc.h>
 
 // RKNN 相关
 #include "rknnPool.hpp"
@@ -35,6 +36,7 @@
 #include "rk_common.h"
 #include "RgaUtils.h"
 #include "im2d.h"
+#include "im2d.hpp"
 #include "rga.h"
 #include "v4l2_dmabuf_capture.h"
 
@@ -42,6 +44,326 @@
 #ifdef USE_RTSP_MPP
 #include "rtsp_mpp_sender.h"
 #include "ffmpeg_rkmpp_reader.h"
+#endif
+
+#ifdef USE_RTSP_MPP
+namespace {
+
+struct RawVideoRtspDecoderContext {
+    AVFormatContext* format_ctx = nullptr;
+    AVCodecContext* codec_ctx = nullptr;
+    AVBufferRef* hw_device_ctx = nullptr;
+    AVPacket* packet = nullptr;
+    AVFrame* frame = nullptr;
+    int video_stream = -1;
+    bool sent_eof = false;
+    double fps = 25.0;
+    int width = 0;
+    int height = 0;
+};
+
+struct RawVideoDmabufFrameInfo {
+    bool valid = false;
+    int fd = -1;
+    int size = 0;
+    int width = 0;
+    int height = 0;
+    int wstride = 0;
+    int hstride = 0;
+    uint32_t drm_format = 0;
+};
+
+static const char* PickRawVideoDecoderName(AVCodecID codec_id) {
+    switch (codec_id) {
+    case AV_CODEC_ID_H264:
+        return "h264_rkmpp";
+    case AV_CODEC_ID_HEVC:
+        return "hevc_rkmpp";
+    case AV_CODEC_ID_MJPEG:
+        return "mjpeg_rkmpp";
+    case AV_CODEC_ID_VP8:
+        return "vp8_rkmpp";
+    case AV_CODEC_ID_VP9:
+        return "vp9_rkmpp";
+    case AV_CODEC_ID_MPEG2VIDEO:
+        return "mpeg2_rkmpp";
+    case AV_CODEC_ID_MPEG4:
+        return "mpeg4_rkmpp";
+    default:
+        return nullptr;
+    }
+}
+
+static enum AVPixelFormat PreferRawVideoDrmPrime(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
+    (void)ctx;
+    enum AVPixelFormat fallback = AV_PIX_FMT_NONE;
+    bool saw_drm = false;
+    bool saw_nv12 = false;
+
+    printf("[RTSP-RAW-VIDEO] get_format candidates:");
+    for (const enum AVPixelFormat* p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
+        const char* name = av_get_pix_fmt_name(*p);
+        printf(" %s(%d)", name ? name : "unknown", *p);
+        if (fallback == AV_PIX_FMT_NONE) fallback = *p;
+        if (*p == AV_PIX_FMT_DRM_PRIME) saw_drm = true;
+        if (*p == AV_PIX_FMT_NV12) saw_nv12 = true;
+    }
+    printf("\n");
+
+    if (saw_drm) return AV_PIX_FMT_DRM_PRIME;
+    if (saw_nv12) return AV_PIX_FMT_NV12;
+    return fallback;
+}
+
+static void CloseRawVideoRtspDecoder(RawVideoRtspDecoderContext* ctx) {
+    if (!ctx) return;
+    av_packet_free(&ctx->packet);
+    av_frame_free(&ctx->frame);
+    avcodec_free_context(&ctx->codec_ctx);
+    avformat_close_input(&ctx->format_ctx);
+    av_buffer_unref(&ctx->hw_device_ctx);
+    ctx->video_stream = -1;
+    ctx->sent_eof = false;
+    ctx->fps = 25.0;
+    ctx->width = 0;
+    ctx->height = 0;
+}
+
+static bool OpenRawVideoRtspDecoder(const std::string& input_path, RawVideoRtspDecoderContext* ctx) {
+    if (!ctx) return false;
+    CloseRawVideoRtspDecoder(ctx);
+
+    int ret = av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_RKMPP, nullptr, nullptr, 0);
+    printf("[RTSP-RAW-VIDEO] av_hwdevice_ctx_create ret=%d\n", ret);
+    if (ret < 0) return false;
+
+    ret = avformat_open_input(&ctx->format_ctx, input_path.c_str(), nullptr, nullptr);
+    printf("[RTSP-RAW-VIDEO] avformat_open_input ret=%d path=%s\n", ret, input_path.c_str());
+    if (ret < 0) return false;
+
+    ret = avformat_find_stream_info(ctx->format_ctx, nullptr);
+    if (ret < 0) return false;
+
+    ctx->video_stream = av_find_best_stream(ctx->format_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (ctx->video_stream < 0) return false;
+
+    AVStream* stream = ctx->format_ctx->streams[ctx->video_stream];
+    const char* decoder_name = PickRawVideoDecoderName(stream->codecpar->codec_id);
+    if (!decoder_name) return false;
+
+    const AVCodec* codec = avcodec_find_decoder_by_name(decoder_name);
+    if (!codec) return false;
+
+    ctx->codec_ctx = avcodec_alloc_context3(codec);
+    if (!ctx->codec_ctx) return false;
+
+    ret = avcodec_parameters_to_context(ctx->codec_ctx, stream->codecpar);
+    if (ret < 0) return false;
+
+    ctx->codec_ctx->get_format = PreferRawVideoDrmPrime;
+    ctx->codec_ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
+
+    ret = avcodec_open2(ctx->codec_ctx, codec, nullptr);
+    printf("[RTSP-RAW-VIDEO] avcodec_open2 ret=%d\n", ret);
+    if (ret < 0) return false;
+
+    ctx->packet = av_packet_alloc();
+    ctx->frame = av_frame_alloc();
+    if (!ctx->packet || !ctx->frame) return false;
+
+    ctx->width = ctx->codec_ctx->width;
+    ctx->height = ctx->codec_ctx->height;
+    ctx->fps = av_q2d(stream->avg_frame_rate);
+    if (ctx->fps <= 0.0) ctx->fps = av_q2d(stream->r_frame_rate);
+    if (ctx->fps <= 0.0) ctx->fps = 25.0;
+    ctx->sent_eof = false;
+    return true;
+}
+
+static bool ConvertRawVideoDrmPrimeToBgr(const AVFrame* frame, cv::Mat* bgr_frame) {
+    if (!frame || !bgr_frame || frame->format != AV_PIX_FMT_DRM_PRIME || !frame->data[0]) {
+        return false;
+    }
+
+    AVDRMFrameDescriptor* desc = reinterpret_cast<AVDRMFrameDescriptor*>(frame->data[0]);
+    if (!desc || desc->nb_layers < 1 || desc->layers[0].nb_planes < 2) {
+        return false;
+    }
+
+    const int object_index = desc->layers[0].planes[0].object_index;
+    if (object_index < 0 || object_index >= (int)desc->nb_objects) {
+        return false;
+    }
+
+    const uint32_t drm_format = desc->layers[0].format;
+    if (drm_format != DRM_FORMAT_NV12) {
+        printf("[RTSP-RAW-VIDEO] unsupported DRM format: 0x%08x\n", drm_format);
+        return false;
+    }
+
+    const int src_fd = desc->objects[object_index].fd;
+    const int src_wstride = (int)desc->layers[0].planes[0].pitch;
+    const int uv_offset = (int)desc->layers[0].planes[1].offset;
+    int src_hstride = frame->height;
+    if (src_wstride > 0 && uv_offset > 0) {
+        src_hstride = std::max(frame->height, uv_offset / src_wstride);
+    }
+
+    if (src_fd < 0 || src_wstride <= 0) {
+        return false;
+    }
+
+    bgr_frame->create(frame->height, frame->width, CV_8UC3);
+    const int dst_size = bgr_frame->cols * bgr_frame->rows * 3;
+
+    rga_buffer_handle_t src_handle = importbuffer_fd(src_fd, src_wstride, src_hstride, RK_FORMAT_YCbCr_420_SP);
+    rga_buffer_handle_t dst_handle = importbuffer_virtualaddr(bgr_frame->data, dst_size);
+    if (!src_handle || !dst_handle) {
+        if (src_handle) releasebuffer_handle(src_handle);
+        if (dst_handle) releasebuffer_handle(dst_handle);
+        return false;
+    }
+
+    rga_buffer_t src_img = wrapbuffer_handle_t(src_handle, frame->width, frame->height,
+                                               src_wstride, src_hstride, RK_FORMAT_YCbCr_420_SP);
+    rga_buffer_t dst_img = wrapbuffer_handle_t(dst_handle, frame->width, frame->height,
+                                               frame->width, frame->height, RK_FORMAT_BGR_888);
+
+    IM_STATUS status = imcvtcolor(src_img, dst_img, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_BGR_888);
+    releasebuffer_handle(src_handle);
+    releasebuffer_handle(dst_handle);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        printf("[RTSP-RAW-VIDEO] imcvtcolor failed: %s\n", imStrError(status));
+        return false;
+    }
+    return true;
+}
+
+static void ClearRawVideoDmabufFrameInfo(RawVideoDmabufFrameInfo* frame_info) {
+    if (!frame_info) return;
+    if (frame_info->fd >= 0) {
+        close(frame_info->fd);
+    }
+    *frame_info = RawVideoDmabufFrameInfo{};
+}
+
+static bool ExtractRawVideoDrmPrimeInfo(const AVFrame* frame, RawVideoDmabufFrameInfo* frame_info) {
+    if (!frame_info) return false;
+    ClearRawVideoDmabufFrameInfo(frame_info);
+
+    if (!frame || frame->format != AV_PIX_FMT_DRM_PRIME || !frame->data[0]) {
+        return false;
+    }
+
+    AVDRMFrameDescriptor* desc = reinterpret_cast<AVDRMFrameDescriptor*>(frame->data[0]);
+    if (!desc || desc->nb_layers < 1 || desc->layers[0].nb_planes < 2) {
+        return false;
+    }
+
+    const int object_index = desc->layers[0].planes[0].object_index;
+    if (object_index < 0 || object_index >= (int)desc->nb_objects) {
+        return false;
+    }
+
+    const int src_fd = desc->objects[object_index].fd;
+    const int dup_fd = dup(src_fd);
+    if (dup_fd < 0) {
+        return false;
+    }
+
+    const int src_wstride = (int)desc->layers[0].planes[0].pitch;
+    const int uv_offset = (int)desc->layers[0].planes[1].offset;
+    int src_hstride = frame->height;
+    if (src_wstride > 0 && uv_offset > 0) {
+        src_hstride = std::max(frame->height, uv_offset / src_wstride);
+    }
+
+    frame_info->valid = true;
+    frame_info->fd = dup_fd;
+    frame_info->size = (int)desc->objects[object_index].size;
+    frame_info->width = frame->width;
+    frame_info->height = frame->height;
+    frame_info->wstride = src_wstride;
+    frame_info->hstride = src_hstride;
+    frame_info->drm_format = desc->layers[0].format;
+    return true;
+}
+
+static bool ReadRawVideoRtspFrame(RawVideoRtspDecoderContext* ctx, cv::Mat* bgr_frame,
+                                  RawVideoDmabufFrameInfo* frame_info = nullptr) {
+    if (!ctx) return false;
+    if (bgr_frame) {
+        bgr_frame->release();
+    }
+    if (frame_info) {
+        ClearRawVideoDmabufFrameInfo(frame_info);
+    }
+
+    while (true) {
+        int ret = avcodec_receive_frame(ctx->codec_ctx, ctx->frame);
+        if (ret == AVERROR(EAGAIN)) {
+            break;
+        }
+        if (ret == AVERROR_EOF) {
+            return false;
+        }
+        if (ret < 0) {
+            return false;
+        }
+
+        static int raw_video_decode_log_counter = 0;
+        raw_video_decode_log_counter++;
+        if (raw_video_decode_log_counter == 1 || (raw_video_decode_log_counter % 120) == 0) {
+            const char* fmt_name = av_get_pix_fmt_name((AVPixelFormat)ctx->frame->format);
+            printf("[RTSP-RAW-VIDEO] frame format=%s width=%d height=%d frame=%d\n",
+                   fmt_name ? fmt_name : "unknown",
+                   ctx->frame->width,
+                   ctx->frame->height,
+                   raw_video_decode_log_counter);
+        }
+
+        bool ok = false;
+        if (ctx->frame->format == AV_PIX_FMT_DRM_PRIME) {
+            bool dmabuf_ok = frame_info ? ExtractRawVideoDrmPrimeInfo(ctx->frame, frame_info) : false;
+            if (dmabuf_ok) {
+                ok = true;
+            } else if (bgr_frame) {
+                ok = ConvertRawVideoDrmPrimeToBgr(ctx->frame, bgr_frame);
+            }
+        }
+
+        av_frame_unref(ctx->frame);
+        return ok;
+    }
+
+    while (true) {
+        if (ctx->sent_eof) {
+            return false;
+        }
+
+        int ret = av_read_frame(ctx->format_ctx, ctx->packet);
+        if (ret < 0) {
+            avcodec_send_packet(ctx->codec_ctx, nullptr);
+            ctx->sent_eof = true;
+            continue;
+        }
+
+        if (ctx->packet->stream_index != ctx->video_stream) {
+            av_packet_unref(ctx->packet);
+            continue;
+        }
+
+        ret = avcodec_send_packet(ctx->codec_ctx, ctx->packet);
+        av_packet_unref(ctx->packet);
+        if (ret < 0) {
+            return false;
+        }
+
+        return ReadRawVideoRtspFrame(ctx, bgr_frame, frame_info);
+    }
+}
+
+}  // namespace
 #endif
 
 // ---------------------- 配置 ----------------------
@@ -94,7 +416,14 @@ std::atomic<bool> g_rtsp_streaming(false);
 RtspMppSender* g_rtsp_sender0 = nullptr;
 RtspMppSender* g_rtsp_sender1 = nullptr;
 RtspMppSender* g_rtsp_sender_video = nullptr;  // 视频模式专用推流
+std::thread g_video_rtsp_raw_thread;
+std::atomic<bool> g_video_rtsp_raw_running(false);
+std::atomic<bool> g_video_rtsp_raw_stop(false);
 std::mutex g_rtsp_mutex;
+
+extern std::atomic<bool> g_video_mode;
+extern std::atomic<bool> g_video_loop;
+extern std::string g_video_path;
 
 void destroy_rtsp_sender(RtspMppSender*& sender) {
     if (!sender) return;
@@ -108,10 +437,107 @@ void stop_rtsp_senders_locked() {
     destroy_rtsp_sender(g_rtsp_sender1);
     destroy_rtsp_sender(g_rtsp_sender_video);
 }
+
+void stop_video_rtsp_raw_thread() {
+    g_video_rtsp_raw_stop = true;
+    if (g_video_rtsp_raw_thread.joinable()) {
+        g_video_rtsp_raw_thread.join();
+    }
+    g_video_rtsp_raw_running = false;
+}
+
+void video_rtsp_raw_loop() {
+    g_video_rtsp_raw_running = true;
+    g_video_rtsp_raw_stop = false;
+
+    RawVideoRtspDecoderContext decoder;
+    if (!OpenRawVideoRtspDecoder(g_video_path, &decoder)) {
+        printf("[RTSP-RAW-VIDEO] 无法打开视频: %s\n", g_video_path.c_str());
+        g_video_rtsp_raw_running = false;
+        return;
+    }
+
+    double fps = decoder.fps;
+    if (fps <= 0.0) fps = 25.0;
+    auto frame_interval = std::chrono::microseconds((int)(1000000.0 / fps));
+    auto next_deadline = std::chrono::steady_clock::now();
+    int pushed = 0;
+
+    while (!g_video_rtsp_raw_stop.load() && g_running.load()) {
+        if (!g_rtsp_streaming.load() || !g_video_mode.load() || g_model_loaded.load()) {
+            break;
+        }
+
+        cv::Mat frame;
+        RawVideoDmabufFrameInfo frame_info;
+        if (!ReadRawVideoRtspFrame(&decoder, &frame, &frame_info) ||
+            (!frame_info.valid && frame.empty())) {
+            ClearRawVideoDmabufFrameInfo(&frame_info);
+            if (g_video_loop.load()) {
+                CloseRawVideoRtspDecoder(&decoder);
+                if (!OpenRawVideoRtspDecoder(g_video_path, &decoder)) {
+                    printf("[RTSP-RAW-VIDEO] 循环重开失败: %s\n", g_video_path.c_str());
+                    break;
+                }
+                fps = decoder.fps;
+                if (fps <= 0.0) fps = 25.0;
+                frame_interval = std::chrono::microseconds((int)(1000000.0 / fps));
+                next_deadline = std::chrono::steady_clock::now();
+                continue;
+            }
+            printf("[RTSP-RAW-VIDEO] 视频播放完毕\n");
+            break;
+        }
+
+        bool pushed_ok = false;
+        {
+            std::lock_guard<std::mutex> lock(g_rtsp_mutex);
+            if (g_rtsp_sender_video && g_rtsp_sender_video->inited()) {
+                if (frame_info.valid) {
+                    pushed_ok = g_rtsp_sender_video->push_dmabuf(
+                        frame_info.fd,
+                        frame_info.size,
+                        frame_info.width,
+                        frame_info.height,
+                        frame_info.wstride,
+                        frame_info.hstride,
+                        frame_info.drm_format);
+                } else if (!frame.empty()) {
+                    pushed_ok = g_rtsp_sender_video->push(frame);
+                }
+            }
+        }
+        ClearRawVideoDmabufFrameInfo(&frame_info);
+        if (!pushed_ok) {
+            printf("[RTSP-RAW-VIDEO] 推流写包失败，停止裸流线程\n");
+            break;
+        }
+
+        ++pushed;
+        if ((pushed % 120) == 0) {
+            printf("[RTSP-RAW-VIDEO] pushed=%d fps=%.1f\n", pushed, fps);
+        }
+
+        next_deadline += frame_interval;
+        std::this_thread::sleep_until(next_deadline);
+    }
+
+    CloseRawVideoRtspDecoder(&decoder);
+    g_video_rtsp_raw_running = false;
+}
+
+void start_video_rtsp_raw_thread_if_needed() {
+    if (g_video_rtsp_raw_running.load()) {
+        return;
+    }
+    g_video_rtsp_raw_thread = std::thread(video_rtsp_raw_loop);
+}
 #endif
 
 // 视频文件处理
 struct VideoFrameInfo {
+    bool valid = false;
+    int fd = -1;
     bool nv12_valid = false;
     cv::Mat nv12_packed;
     int size = 0;
@@ -119,6 +545,7 @@ struct VideoFrameInfo {
     int height = 0;
     int wstride = 0;
     int hstride = 0;
+    uint32_t drm_format = 0;
 };
 
 std::atomic<bool> g_video_mode(false);  // 是否为视频文件模式
@@ -468,7 +895,7 @@ bool open_video_source_locked() {
             g_video_fps = (int)(g_video_hw_reader->Fps() + 0.5);
         }
         g_video_hw_enabled = true;
-        printf("[Video] FFmpeg + RGA 已打开: %dx%d @ %.1f fps (decoder=%s)\n",
+        printf("[Video] FFmpeg DRM_PRIME 已打开: %dx%d @ %.1f fps (decoder=%s)\n",
                g_video_width.load(), g_video_height.load(), g_video_hw_reader->Fps(),
                g_video_hw_reader->DecoderName().c_str());
         return true;
@@ -506,11 +933,14 @@ bool read_video_frame_locked(cv::Mat& frame, VideoFrameInfo* frame_info = nullpt
             if (!frame_info || !reader_info_ptr) return;
             frame_info->nv12_valid = reader_info_ptr->nv12_valid;
             frame_info->nv12_packed = reader_info_ptr->nv12_packed;
+            frame_info->valid = reader_info_ptr->valid;
+            frame_info->fd = reader_info_ptr->fd;
             frame_info->size = reader_info_ptr->size;
             frame_info->width = reader_info_ptr->width;
             frame_info->height = reader_info_ptr->height;
             frame_info->wstride = reader_info_ptr->wstride;
             frame_info->hstride = reader_info_ptr->hstride;
+            frame_info->drm_format = reader_info_ptr->drm_format;
         };
 
         if (g_video_hw_reader->ReadFrame(frame, reader_info_ptr) && !frame.empty()) {
@@ -624,6 +1054,9 @@ void video_reader_loop() {
 }
 
 void stop_video_reader() {
+#ifdef USE_RTSP_MPP
+    stop_video_rtsp_raw_thread();
+#endif
     {
         std::lock_guard<std::mutex> lock(g_video_mutex);
         g_video_running = false;
@@ -981,6 +1414,7 @@ void handle_client(int client_fd) {
         }
         if (value < 0.0f) value = 0.0f;
         if (value > 1.0f) value = 1.0f;
+        g_confidence_threshold.store(value);
         rknn_lite::set_detection_threshold(value);
         send_response(client_fd, build_json_response("success",
             "阈值已设置为: " + std::to_string(value)), "application/json");
@@ -1237,6 +1671,9 @@ void handle_client(int client_fd) {
 
         std::string load_msg;
         if (!g_model_loaded.load()) {
+#ifdef USE_RTSP_MPP
+            stop_video_rtsp_raw_thread();
+#endif
             if (!ensure_model_loaded(&load_msg)) {
                 g_inference_enabled = false;
                 g_tracker_enabled = false;
@@ -1531,10 +1968,14 @@ void handle_client(int client_fd) {
             printf("[RTSP] 视频推流已启动 (%dx%d @ %dfps)\n", vw, vh, vf > 0 ? vf : 25);
         }
         g_rtsp_streaming = true;
+        if (!g_model_loaded.load()) {
+            start_video_rtsp_raw_thread_if_needed();
+        }
         send_response(client_fd, build_json_response("success",
             "视频推流已启动 (" + std::to_string(vw) + "x" + std::to_string(vh) + ")"), "application/json");
     }
     else if (route == "/api/rtsp/stop" && method == "POST") {
+        g_video_rtsp_raw_stop = true;
         {
             std::lock_guard<std::mutex> lock(g_rtsp_mutex);
             bool was_streaming = g_rtsp_streaming.load();
@@ -1543,6 +1984,7 @@ void handle_client(int client_fd) {
             printf("[RTSP] /api/rtsp/stop: was_streaming=%d, sender 已销毁, rss=%ldKB\n",
                    was_streaming ? 1 : 0, get_process_rss_kb());
         }
+        stop_video_rtsp_raw_thread();
         send_response(client_fd, build_json_response("success", "RTSP 推流已停止"), "application/json");
     }
 #endif
@@ -1648,6 +2090,9 @@ void http_server_thread() {
 void signal_handler(int sig) {
     printf("\n[Main] 收到信号 %d, 正在停止...\n", sig);
     g_running = false;
+    g_inference_enabled = false;
+    g_tracker_enabled = false;
+    g_model_switching = true;
 
     if (g_server_fd >= 0) {
         shutdown(g_server_fd, SHUT_RDWR);
@@ -1657,6 +2102,7 @@ void signal_handler(int sig) {
 
 #ifdef USE_RTSP_MPP
     g_rtsp_streaming = false;
+    g_video_rtsp_raw_stop = true;
 #endif
 
     g_video_mode = false;
@@ -1803,6 +2249,8 @@ int main(int argc, char** argv) {
     // FPS 统计
     int frames0 = 0, frames1 = 0;
     int push0 = 0, push1 = 0;
+    bool video_raw_pace_initialized = false;
+    auto video_raw_next_deadline = std::chrono::steady_clock::now();
     struct timeval time_start, time_now;
     gettimeofday(&time_start, nullptr);
     long last_fps_time_ms = time_start.tv_sec * 1000 + time_start.tv_usec / 1000;
@@ -1822,70 +2270,16 @@ int main(int argc, char** argv) {
             // 未加载模型时，仍允许 RTSP 裸流（不做推理）
             if (g_rtsp_streaming.load()) {
                 if (g_video_mode.load()) {
-                    cv::Mat raw_video;
-                    bool got_frame = false;
-
-                    {
-                        std::lock_guard<std::mutex> lock(g_video_mutex);
-                        if (g_video_running.load() && g_video_mode.load()) {
-                            if (!ensure_video_source_open_locked()) {
-                                printf("[Video] 无法打开视频: %s\n", g_video_path.c_str());
-                                g_video_running = false;
-                                g_video_mode = false;
-                            } else {
-                                got_frame = read_video_frame_locked(raw_video);
-                            }
-                        }
-
-                        if (!got_frame) {
-                            close_video_source_locked();
-                            g_video_running = false;
-                            g_video_mode = false;
-                            clear_video_queue_locked();
-                        }
-                    }
-
-                    if (got_frame && !raw_video.empty()) {
-                        frames0++;
-                        {
-                            std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
-                            g_latest_frame = raw_video.clone();
-                            g_frame_available = true;
-                            g_latest_frame_slot = 0;
-                        }
-                        {
-                            std::lock_guard<std::mutex> rtsp_lock(g_rtsp_mutex);
-                            if (g_rtsp_sender_video && g_rtsp_sender_video->inited()) {
-                                if (g_rtsp_sender_video->push(raw_video)) {
-                                    push0++;
-                                } else {
-                                    printf("[RTSP] 视频裸流写包失败，已自动停止\n");
-                                    g_rtsp_streaming = false;
-                                }
-                            }
-                        }
-                    } else {
+                    if (!g_video_rtsp_raw_running.load()) {
+                        start_video_rtsp_raw_thread_if_needed();
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    }
-
-                    gettimeofday(&time_now, nullptr);
-                    long now_ms = time_now.tv_sec * 1000 + time_now.tv_usec / 1000;
-                    if (now_ms - last_fps_time_ms >= 1000) {
-                        float elapsed = (now_ms - last_fps_time_ms) / 1000.0f;
-                        g_cam0_fps.store((int)(frames0 / elapsed));
-                        g_cam1_fps.store(0);
-                        if (push0 > 0) {
-                            printf("[FPS-RAW-VIDEO] Video: %d FPS | RTSP: %d\n",
-                                   g_cam0_fps.load(), push0);
-                        }
-                        frames0 = 0;
-                        frames1 = 0;
-                        push0 = 0;
-                        push1 = 0;
-                        last_fps_time_ms = now_ms;
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
                     }
                     continue;
                 }
+
+                video_raw_pace_initialized = false;
 
                 bool got_frame = false;
 
@@ -2085,6 +2479,14 @@ int main(int argc, char** argv) {
                     g_video_running = false;
                     g_video_mode = false;
                     printf("[Video] 视频播放完毕\n");
+                } else if (video_frame_info.valid) {
+                    if (i >= 0 && i < (int)rkpool.size() && rkpool[i]) {
+                        rkpool[i]->set_video_dmabuf_frame(video_frame_info.fd, video_frame_info.size,
+                                                          video_frame_info.width, video_frame_info.height,
+                                                          video_frame_info.wstride, video_frame_info.hstride,
+                                                          video_frame_info.drm_format);
+                        video_frame_info.fd = -1;
+                    }
                 } else if (video_frame_info.nv12_valid) {
                     if (i >= 0 && i < (int)rkpool.size() && rkpool[i]) {
                         rkpool[i]->set_video_nv12_frame(video_frame_info.nv12_packed,
@@ -2204,30 +2606,16 @@ int main(int argc, char** argv) {
     
     printf("[Main] 等待退出...\n");
     http_thread.join();
-    
-    // 等待所有推理完成
-    auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (std::chrono::steady_clock::now() < cleanup_deadline) {
-        bool has_busy_slot = false;
-        for (const auto& slot_state : slot_states) {
-            if (slot_state.busy.load()) {
-                has_busy_slot = true;
-                break;
-            }
+
+    std::string unload_msg;
+    if (g_model_loaded.load() || g_active_jobs.load() > 0) {
+        if (!unload_model_runtime(&unload_msg)) {
+            printf("[Main] 警告: %s\n", unload_msg.c_str());
+        } else {
+            printf("[Main] 模型资源已清理\n");
         }
-        if (!has_busy_slot) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
-    // 清理
-    {
-        std::lock_guard<std::mutex> lock(g_model_mutex);
-        release_model_workers_locked();
-        g_model_loaded = false;
-        g_model_loading = false;
-    }
-    rknn_lite::reset_shared_deepsort_trackers();
-    rknn_lite::reset_shared_bytetrack_trackers();
+
     if (cap0.isOpened()) cap0.release();
     if (cap1.isOpened()) cap1.release();
     v4l2_dmabuf::close_capture(&dmabuf_cap0);
@@ -2236,6 +2624,7 @@ int main(int argc, char** argv) {
 #ifdef USE_RTSP_MPP
     {
         std::lock_guard<std::mutex> lock(g_rtsp_mutex);
+        g_video_rtsp_raw_stop = true;
         stop_rtsp_senders_locked();
     }
 #endif

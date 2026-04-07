@@ -1,15 +1,17 @@
 #ifndef RTSP_MPP_SENDER_H
 #define RTSP_MPP_SENDER_H
 
+#include <cstdint>
 #include <opencv2/core.hpp>
 
-/** 使用 MPP 硬件编码 + FFmpeg 将 BGR 帧推送到 RTSP。用法：init(url,w,h,fps) -> push(bgr_mat) -> destroy() */
+/** 使用 MPP 硬件编码 + FFmpeg 推送到 RTSP，支持 BGR Mat 和 NV12 dma-buf 两种输入。 */
 class RtspMppSender {
 public:
     RtspMppSender() = default;
     ~RtspMppSender() { destroy(); }
     bool init(const char* rtsp_url, int width, int height, int fps = 30);
     bool push(cv::Mat& bgr_frame);
+    bool push_dmabuf(int fd, int size, int width, int height, int wstride, int hstride, uint32_t drm_format);
     void destroy();
     bool inited() const { return inited_; }
 private:

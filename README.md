@@ -43,8 +43,13 @@ yolov8-rk3588-cpp-3-15/
 
 ## 当前视频链路
 
-- 视频文件输入已切回 `FFmpeg RKMPP 解码 + RGA 预处理`
-- 视频模式下不再依赖 `DRM_PRIME` 作为推理输入链路
+- `main_http_ctrl` 的视频文件主链路已切为：
+  - `FFmpeg h264_rkmpp/hevc_rkmpp` 解码
+  - 优先输出 `AV_PIX_FMT_DRM_PRIME`
+  - 从 `AVDRMFrameDescriptor` 提取 `dma-buf fd`
+  - `rkpool[i]->set_video_dmabuf_frame(...)`
+  - `RGA -> RKNN input_mem`
+- 如果 `DRM_PRIME` 不可用，代码仍保留 `NV12` 与 `OpenCV/FFmpeg` 回退路径
 - `cam3` 现在支持两种工作方式：
   - 仅视频裸流：`/api/video/start` + `/api/rtsp/video/start`
   - 视频推理流：在上面基础上再调用 `/api/inference/on`
@@ -54,6 +59,7 @@ yolov8-rk3588-cpp-3-15/
 - `cam0` / `cam1`：`h264 640x480 @ 30fps`
 - `cam3`：`h264 1920x1080 @ 25fps`
 - 本机 `ffprobe` / `ffmpeg` 均可直接拉流
+- `main_http_ctrl` 视频推理日志可见 `frame_fmt=drm_prime(179) drm_valid=1`
 
 ## 编译
 
@@ -193,7 +199,7 @@ curl -X POST $BASE/api/rtsp/video/start
 如果要做视频推理，再启动推理：
 
 ```bash
-curl -X POST "$BASE/api/inference/on?track=1&tracker=deepsort&tracker_skip=2&model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn&reid_model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/osnet_x0_25_market.rknn"
+curl -X POST "$BASE/api/inference/on?track=0&model=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn"
 ```
 
 启动视频 RTSP：
@@ -205,6 +211,14 @@ curl -X POST $BASE/api/rtsp/video/start
 视频 RTSP 地址：
 
 - `rtsp://127.0.0.1:8554/cam3`
+
+当前实现说明：
+
+- 视频文件模式下，worker 输入优先走 `DRM_PRIME dma-buf`
+- HTTP 预览和 RTSP 叠框显示仍保留 `cv::Mat(BGR)` 路径
+- 因此同一帧会同时存在：
+  - 一条用于推理的 `drm fd`
+  - 一条用于显示/推流预览的 `BGR Mat`
 
 ## 跟踪器说明
 
@@ -317,6 +331,40 @@ ffplay -rtsp_transport tcp rtsp://127.0.0.1:8554/cam1
 
 - `cam3` 启动后如果立刻探测，首次偶发 `404` 属于发布路径尚未稳定，通常等待约 `1` 秒再探测即可
 - 视频 RTSP 当前仍可能出现 `non monotonically increasing dts` 警告，但不影响本机 `ffprobe` / `ffmpeg` 拉流与解码
+
+## 用工具验证 DRM_PRIME
+
+最小探针：
+
+```bash
+./tools/test_video_dma.sh
+```
+
+它会验证：
+
+- `FFmpeg RKMPP` 能否把本地 MP4 解到 `NV12`
+- 解码器能否输出 `AV_PIX_FMT_DRM_PRIME`
+- `DRM_PRIME` 图层格式是否为 `NV12`
+- 是否能拿到有效 `dma-buf fd`
+
+独立 RTSP 推流测试：
+
+```bash
+cmake --build build -j4 --target drmprime_rtsp_push_test
+
+./build/drmprime_rtsp_push_test \
+  /home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/video/person.mp4 \
+  rtsp://127.0.0.1:8554/drmprime-test \
+  --loop
+```
+
+本机验证：
+
+```bash
+ffprobe -v error -rtsp_transport tcp \
+  -show_entries stream=codec_name,width,height,avg_frame_rate \
+  -of json rtsp://127.0.0.1:8554/drmprime-test
+```
 
 ## 命令行程序 `rknn_yolov8_demo`
 

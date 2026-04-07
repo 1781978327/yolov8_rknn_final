@@ -6,6 +6,7 @@
 #include "command_mpp.h"
 #include "ffmpeg_with_mpp.h"
 #include <opencv2/imgproc.hpp>
+#include <libdrm/drm_fourcc.h>
 #include <rockchip/rk_mpi.h>
 #include <rockchip/mpp_buffer.h>
 #include <rockchip/mpp_frame.h>
@@ -52,6 +53,10 @@ struct MppRtspContext {
     MppTask task = nullptr;
     MppMeta meta = nullptr;
     int mpp_initialized = 0;
+    MppFrameFormat prep_format = MPP_FMT_YUV420P;
+    unsigned int prep_hor_stride = 0;
+    unsigned int prep_ver_stride = 0;
+    unsigned int dmabuf_push_count = 0;
     Command cmd;
 };
 
@@ -67,6 +72,33 @@ static void rkmpp_release_packet(void* opaque, uint8_t* data) {
     mpp_packet_deinit(&p->packet);
     if (p->encoder_ref) av_buffer_unref(&p->encoder_ref);
     av_free(p);
+}
+
+static MPP_RET ensure_mpp_prep(MppRtspContext* ctx, MppFrameFormat format,
+                               unsigned int hor_stride, unsigned int ver_stride) {
+    if (!ctx || !ctx->mppApi || !ctx->mppCtx || !ctx->cfg) return MPP_NOK;
+    if (ctx->prep_format == format &&
+        ctx->prep_hor_stride == hor_stride &&
+        ctx->prep_ver_stride == ver_stride) {
+        return MPP_OK;
+    }
+
+    MPP_RET res = ctx->mppApi->control(ctx->mppCtx, MPP_ENC_GET_CFG, ctx->cfg);
+    if (res != MPP_OK) return res;
+
+    mpp_enc_cfg_set_s32(ctx->cfg, "prep:width", ctx->width);
+    mpp_enc_cfg_set_s32(ctx->cfg, "prep:height", ctx->height);
+    mpp_enc_cfg_set_s32(ctx->cfg, "prep:hor_stride", hor_stride);
+    mpp_enc_cfg_set_s32(ctx->cfg, "prep:ver_stride", ver_stride);
+    mpp_enc_cfg_set_s32(ctx->cfg, "prep:format", format);
+
+    res = ctx->mppApi->control(ctx->mppCtx, MPP_ENC_SET_CFG, ctx->cfg);
+    if (res == MPP_OK) {
+        ctx->prep_format = format;
+        ctx->prep_hor_stride = hor_stride;
+        ctx->prep_ver_stride = ver_stride;
+    }
+    return res;
 }
 
 static int init_encoder(MppRtspContext* ctx, Command& obj) {
@@ -175,6 +207,9 @@ static MPP_RET init_mpp(MppRtspContext* ctx) {
     mpp_packet_deinit(&headpacket);
     mpp_buffer_group_get_external(&ctx->group, MPP_BUFFER_TYPE_DRM);
     ctx->mpp_initialized = 1;
+    ctx->prep_format = MPP_FMT_YUV420P;
+    ctx->prep_hor_stride = ctx->hor_stride;
+    ctx->prep_ver_stride = ctx->ver_stride;
     std::cout << "init mpp encoder finished (YOLO RTSP)" << std::endl;
     return res;
 }
@@ -262,7 +297,93 @@ static int send_packet(MppRtspContext* ctx, Command& obj) {
     return r;
 }
 
+static MPP_RET wrap_encoded_packet(MppRtspContext* ctx) {
+    if (!ctx || !ctx->mppPacket || !ctx->packet) return MPP_NOK;
+
+    RKMPPPacketContext* pkt_ctx = (RKMPPPacketContext*)av_mallocz(sizeof(*pkt_ctx));
+    if (!pkt_ctx) {
+        mpp_packet_deinit(&ctx->mppPacket);
+        return MPP_NOK;
+    }
+
+    pkt_ctx->packet = ctx->mppPacket;
+    pkt_ctx->encoder_ref = nullptr;
+    ctx->packet->data = (uint8_t*)mpp_packet_get_data(ctx->mppPacket);
+    ctx->packet->size = mpp_packet_get_length(ctx->mppPacket);
+    ctx->packet->buf = av_buffer_create((uint8_t*)ctx->packet->data, ctx->packet->size,
+                                        rkmpp_release_packet, pkt_ctx, AV_BUFFER_FLAG_READONLY);
+    if (!ctx->packet->buf) {
+        mpp_packet_deinit(&ctx->mppPacket);
+        av_free(pkt_ctx);
+        return MPP_NOK;
+    }
+
+    MppPacket pkt = pkt_ctx->packet;
+    ctx->mppPacket = nullptr;
+    ctx->packet->pts = mpp_packet_get_pts(pkt);
+    ctx->packet->dts = mpp_packet_get_dts(pkt);
+    if (ctx->packet->pts <= 0) ctx->packet->pts = ctx->packet->dts;
+    if (ctx->packet->dts <= 0) ctx->packet->dts = ctx->packet->pts;
+    ctx->meta = mpp_packet_get_meta(pkt);
+    int keyframe = 0;
+    if (ctx->meta) mpp_meta_get_s32(ctx->meta, KEY_OUTPUT_INTRA, &keyframe);
+    if (keyframe) ctx->packet->flags |= AV_PKT_FLAG_KEY;
+    return MPP_OK;
+}
+
+static MPP_RET encode_mpp_frame(MppRtspContext* ctx, MppBuffer frame_buffer,
+                                MppFrameFormat frame_format,
+                                unsigned int frame_width, unsigned int frame_height,
+                                unsigned int frame_hor_stride, unsigned int frame_ver_stride,
+                                size_t frame_size) {
+    if (!ctx || !frame_buffer) return MPP_NOK;
+
+    MPP_RET res = ensure_mpp_prep(ctx, frame_format, frame_hor_stride, frame_ver_stride);
+    if (res != MPP_OK) return res;
+
+    MppBuffer packet_buffer = nullptr;
+    res = mpp_buffer_get(nullptr, &packet_buffer, ctx->image_size);
+    if (res != MPP_OK) return res;
+
+    mpp_frame_init(&ctx->mppframe);
+    mpp_frame_set_width(ctx->mppframe, frame_width);
+    mpp_frame_set_height(ctx->mppframe, frame_height);
+    mpp_frame_set_hor_stride(ctx->mppframe, frame_hor_stride);
+    mpp_frame_set_ver_stride(ctx->mppframe, frame_ver_stride);
+    mpp_frame_set_buf_size(ctx->mppframe, frame_size);
+    mpp_frame_set_buffer(ctx->mppframe, frame_buffer);
+    mpp_frame_set_fmt(ctx->mppframe, frame_format);
+    mpp_frame_set_eos(ctx->mppframe, 0);
+
+    mpp_packet_init_with_buffer(&ctx->mppPacket, packet_buffer);
+    mpp_packet_set_length(ctx->mppPacket, 0);
+
+    ctx->mppApi->poll(ctx->mppCtx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
+    ctx->mppApi->dequeue(ctx->mppCtx, MPP_PORT_INPUT, &ctx->task);
+    mpp_task_meta_set_packet(ctx->task, KEY_OUTPUT_PACKET, ctx->mppPacket);
+    mpp_task_meta_set_frame(ctx->task, KEY_INPUT_FRAME, ctx->mppframe);
+    ctx->mppApi->enqueue(ctx->mppCtx, MPP_PORT_INPUT, ctx->task);
+
+    ctx->mppApi->poll(ctx->mppCtx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
+    ctx->mppApi->dequeue(ctx->mppCtx, MPP_PORT_OUTPUT, &ctx->task);
+    mpp_task_meta_get_packet(ctx->task, KEY_OUTPUT_PACKET, &ctx->mppPacket);
+    ctx->mppApi->enqueue(ctx->mppCtx, MPP_PORT_OUTPUT, ctx->task);
+
+    if (!ctx->mppPacket) {
+        mpp_buffer_put(packet_buffer);
+        return MPP_NOK;
+    }
+
+    res = wrap_encoded_packet(ctx);
+    mpp_buffer_put(packet_buffer);
+    if (res != MPP_OK) return res;
+
+    int send_ret = send_packet(ctx, ctx->cmd);
+    return (send_ret < 0) ? MPP_NOK : MPP_OK;
+}
+
 static MPP_RET convert_cvframe_to_drm(MppRtspContext* ctx, cv::Mat& cvframe, Command& obj) {
+    (void)obj;
     MPP_RET res = mpp_buffer_get(nullptr, &ctx->buffer, ctx->image_size);
     if (res != MPP_OK) return res;
     ctx->info.fd = mpp_buffer_get_fd(ctx->buffer);
@@ -275,55 +396,10 @@ static MPP_RET convert_cvframe_to_drm(MppRtspContext* ctx, cv::Mat& cvframe, Com
     if (res != MPP_OK) return res;
     res = mpp_buffer_get(ctx->group, &ctx->commitBuffer, ctx->image_size);
     if (res != MPP_OK) return res;
-    mpp_frame_init(&ctx->mppframe);
-    mpp_frame_set_width(ctx->mppframe, ctx->width);
-    mpp_frame_set_height(ctx->mppframe, ctx->height);
-    mpp_frame_set_hor_stride(ctx->mppframe, ctx->yuv_hor_stride);
-    mpp_frame_set_ver_stride(ctx->mppframe, ctx->ver_stride);
-    mpp_frame_set_buf_size(ctx->mppframe, ctx->image_size);
-    mpp_frame_set_buffer(ctx->mppframe, ctx->commitBuffer);
-    mpp_frame_set_fmt(ctx->mppframe, MPP_FMT_YUV420P);
-    mpp_frame_set_eos(ctx->mppframe, 0);
-    mpp_packet_init_with_buffer(&ctx->mppPacket, ctx->commitBuffer);
-    mpp_packet_set_length(ctx->mppPacket, 0);
-    ctx->mppApi->poll(ctx->mppCtx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
-    ctx->mppApi->dequeue(ctx->mppCtx, MPP_PORT_INPUT, &ctx->task);
-    mpp_task_meta_set_packet(ctx->task, KEY_OUTPUT_PACKET, ctx->mppPacket);
-    mpp_task_meta_set_frame(ctx->task, KEY_INPUT_FRAME, ctx->mppframe);
-    ctx->mppApi->enqueue(ctx->mppCtx, MPP_PORT_INPUT, ctx->task);
-    ctx->mppApi->poll(ctx->mppCtx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
-    ctx->mppApi->dequeue(ctx->mppCtx, MPP_PORT_OUTPUT, &ctx->task);
-    mpp_task_meta_get_packet(ctx->task, KEY_OUTPUT_PACKET, &ctx->mppPacket);
-    ctx->mppApi->enqueue(ctx->mppCtx, MPP_PORT_OUTPUT, ctx->task);
-    if (ctx->mppPacket) {
-        RKMPPPacketContext* pkt_ctx = (RKMPPPacketContext*)av_mallocz(sizeof(*pkt_ctx));
-        pkt_ctx->packet = ctx->mppPacket;
-        pkt_ctx->encoder_ref = nullptr;
-        ctx->packet->data = (uint8_t*)mpp_packet_get_data(ctx->mppPacket);
-        ctx->packet->size = mpp_packet_get_length(ctx->mppPacket);
-        ctx->packet->buf = av_buffer_create((uint8_t*)ctx->packet->data, ctx->packet->size, rkmpp_release_packet, pkt_ctx, AV_BUFFER_FLAG_READONLY);
-        if (!ctx->packet->buf) {
-            mpp_packet_deinit(&ctx->mppPacket);
-            av_free(pkt_ctx);
-            return MPP_NOK;
-        }
-        MppPacket pkt = pkt_ctx->packet;
-        // packet 所有权已移交给 AVBuffer 的释放回调，避免后续误用/重复释放。
-        ctx->mppPacket = nullptr;
-        ctx->packet->pts = mpp_packet_get_pts(pkt);
-        ctx->packet->dts = mpp_packet_get_dts(pkt);
-        if (ctx->packet->pts <= 0) ctx->packet->pts = ctx->packet->dts;
-        if (ctx->packet->dts <= 0) ctx->packet->dts = ctx->packet->pts;
-        ctx->meta = mpp_packet_get_meta(pkt);
-        int keyframe = 0;
-        if (ctx->meta) mpp_meta_get_s32(ctx->meta, KEY_OUTPUT_INTRA, &keyframe);
-        if (keyframe) ctx->packet->flags |= AV_PKT_FLAG_KEY;
-    }
-    int send_ret = send_packet(ctx, obj);
-    if (send_ret < 0) {
-        return MPP_NOK;
-    }
-    return res;
+    return encode_mpp_frame(ctx, ctx->commitBuffer, MPP_FMT_YUV420P,
+                            ctx->width, ctx->height,
+                            ctx->yuv_hor_stride, ctx->ver_stride,
+                            ctx->image_size);
 }
 
 static int transfer_frame(MppRtspContext* ctx, cv::Mat& cvframe, Command& obj) {
@@ -331,6 +407,34 @@ static int transfer_frame(MppRtspContext* ctx, cv::Mat& cvframe, Command& obj) {
     if (ctx->buffer) { mpp_buffer_put(ctx->buffer); ctx->buffer = nullptr; }
     if (ctx->commitBuffer) { mpp_buffer_put(ctx->commitBuffer); ctx->commitBuffer = nullptr; }
     mpp_buffer_group_clear(ctx->group);
+    mpp_frame_deinit(&ctx->mppframe);
+    return (rc == MPP_OK) ? 0 : -1;
+}
+
+static int transfer_dmabuf_frame(MppRtspContext* ctx,
+                                 int fd, int size, int width, int height,
+                                 int wstride, int hstride, uint32_t drm_format) {
+    if (!ctx || fd < 0 || size <= 0 || width <= 0 || height <= 0) return -1;
+    if (drm_format != DRM_FORMAT_NV12) return -1;
+    if ((unsigned int)width != ctx->width || (unsigned int)height != ctx->height) return -1;
+
+    MppBuffer imported_buffer = nullptr;
+    MppBufferInfo info;
+    memset(&info, 0, sizeof(info));
+    info.type = MPP_BUFFER_TYPE_DRM;
+    info.fd = fd;
+    info.size = (size_t)size;
+    info.index = (int)ctx->framecount;
+
+    MPP_RET rc = mpp_buffer_import(&imported_buffer, &info);
+    if (rc != MPP_OK) return -1;
+
+    rc = encode_mpp_frame(ctx, imported_buffer, MPP_FMT_YUV420SP,
+                          (unsigned int)width, (unsigned int)height,
+                          (unsigned int)(wstride > 0 ? wstride : width),
+                          (unsigned int)(hstride > 0 ? hstride : height),
+                          (size_t)size);
+    mpp_buffer_put(imported_buffer);
     mpp_frame_deinit(&ctx->mppframe);
     return (rc == MPP_OK) ? 0 : -1;
 }
@@ -412,6 +516,27 @@ bool RtspMppSender::push(cv::Mat& bgr_frame) {
         // 让上层感知失败并触发重新初始化。
         destroy();
         return false;
+    }
+    av_packet_unref(ctx->packet);
+    return true;
+}
+
+bool RtspMppSender::push_dmabuf(int fd, int size, int width, int height,
+                                int wstride, int hstride, uint32_t drm_format) {
+    if (!inited_ || !ctx_) return false;
+    MppRtspContext* ctx = (MppRtspContext*)ctx_;
+    int ret = transfer_dmabuf_frame(ctx, fd, size, width, height, wstride, hstride, drm_format);
+    if (ret != 0) {
+        destroy();
+        return false;
+    }
+    ctx->dmabuf_push_count++;
+    if (ctx->dmabuf_push_count == 1 || (ctx->dmabuf_push_count % 120) == 0) {
+        std::cout << "[RTSP-ZEROCOPY] NV12 dma-buf -> MPP encoder"
+                  << " frame=" << ctx->dmabuf_push_count
+                  << " size=" << width << "x" << height
+                  << " stride=" << wstride << "x" << hstride
+                  << " fd=" << fd << std::endl;
     }
     av_packet_unref(ctx->packet);
     return true;

@@ -265,6 +265,33 @@ target_link_libraries(rknn_http_ctrl
     deepsort
 )
 
+if(FFMPEG_RKMPP_FOUND)
+  add_executable(drmprime_rtsp_push_test
+    tools/drmprime_rtsp_push_test.cpp
+    src/rtsp_mpp_sender.cpp
+  )
+
+  target_include_directories(drmprime_rtsp_push_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${OpenCV_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(drmprime_rtsp_push_test
+    ${RGA_LIB}
+    opencv_core opencv_imgproc
+    ${RTSP_MPP_LIBS}
+    pthread
+  )
+
+  if(RTSP_MPP_BUILD_RPATH)
+    set_target_properties(drmprime_rtsp_push_test PROPERTIES
+      BUILD_RPATH "$ORIGIN/lib;${RTSP_MPP_BUILD_RPATH}"
+      INSTALL_RPATH "$ORIGIN/lib;${RTSP_MPP_BUILD_RPATH}"
+    )
+    target_link_options(drmprime_rtsp_push_test PRIVATE -Wl,--disable-new-dtags)
+  endif()
+endif()
+
 # =====================================================================
 # 8. 安装规则
 # =====================================================================

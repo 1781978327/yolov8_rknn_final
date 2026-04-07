@@ -16,6 +16,7 @@
 #include <cctype>
 #include <unistd.h>
 #include <libdrm/drm_fourcc.h>
+#include <rockchip/mpp_buffer.h>
 #include "opencv2/opencv.hpp"
 #include "opencv2/highgui.hpp"
 #include "postprocess.h"
@@ -144,6 +145,7 @@ static std::atomic<int> g_preprocess_video_iomem_log_counter(0);
 static std::atomic<int> g_preprocess_legacy_log_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_fail_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_fallback_counter(0);
+static std::atomic<bool> g_preprocess_video_iomem_disabled(false);
 
 static bool load_labels_from_txt(const std::string& label_path) {
     std::ifstream file(label_path);
@@ -245,6 +247,17 @@ private:
         uint32_t drm_format = 0;
     };
 
+    struct VideoRgbStageBuffer {
+        MppBuffer buffer = nullptr;
+        int fd = -1;
+        void* ptr = nullptr;
+        int size = 0;
+        int width = 0;
+        int height = 0;
+        int wstride = 0;
+        int hstride = 0;
+    };
+
     rknn_app_context_t app_ctx;  // RKNN应用上下文
     int ret;  // 函数返回值
     BYTETracker* bytetrack_;  // BYTETracker 跟踪器
@@ -258,13 +271,14 @@ private:
     rknn_tensor_mem* input_mem_;  // RKNN input io_mem
     bool input_mem_ready_;  // 是否已启用 io_mem 输入
     VideoDmabufFrame video_dmabuf_frame_;  // 视频模式 DRM PRIME 帧
+    VideoRgbStageBuffer video_rgb_stage_buffer_;  // 视频模式 fd-backed RGA 中转 RGB 帧
     cv::Mat video_nv12_frame_;  // 视频模式 packed NV12 帧
     bool video_nv12_valid_;  // 是否存在 packed NV12 帧
     int video_nv12_width_;  // packed NV12 逻辑宽度
     int video_nv12_height_;  // packed NV12 逻辑高度
     int video_nv12_wstride_;  // packed NV12 stride
     int video_nv12_hstride_;  // packed NV12 height stride
-    static float detection_threshold;  // 置信度阈值
+    static std::atomic<float> detection_threshold;  // 置信度阈值
 
 public:
     cv::Mat ori_img;  // 原始图像
@@ -300,6 +314,10 @@ public:
 
 private:
     bool upload_rgb_to_input_mem(const cv::Mat& rgb_image);
+    bool upload_rgb_fd_to_input_mem(int fd, int width, int height, int wstride, int hstride);
+    void release_video_rgb_stage_buffer();
+    bool ensure_video_rgb_stage_buffer(int width, int height);
+    bool preprocess_video_dmabuf_via_rgb_stage();
     bool preprocess_video_dmabuf_to_input_mem();
     bool preprocess_video_nv12_to_input_mem();
     int draw_tracker_results(cv::Mat& img, const std::vector<TrackerResultItem>& tracks);
@@ -315,7 +333,7 @@ private:
 };
 
 // 静态成员初始化
-float rknn_lite::detection_threshold = 0.5f;
+std::atomic<float> rknn_lite::detection_threshold(0.5f);
 std::atomic<int> rknn_lite::last_detection_count(0);
 
 // 构造函数：初始化RKNN模型
@@ -328,6 +346,7 @@ rknn_lite::rknn_lite(char* model_path, int core_id) {
     last_tracker_feature_match_ = true;
     input_mem_ = nullptr;
     input_mem_ready_ = false;
+    video_rgb_stage_buffer_ = VideoRgbStageBuffer{};
     video_nv12_valid_ = false;
     video_nv12_width_ = 0;
     video_nv12_height_ = 0;
@@ -470,18 +489,22 @@ rknn_lite::rknn_lite(char* model_path, int core_id) {
 
 // 析构函数：释放资源
 rknn_lite::~rknn_lite() {
-    if (app_ctx.rknn_ctx != 0) {
-        rknn_destroy(app_ctx.rknn_ctx);
-    }
-    if (app_ctx.input_attrs != nullptr) {
-        delete[] app_ctx.input_attrs;
-    }
-    if (app_ctx.output_attrs != nullptr) {
-        delete[] app_ctx.output_attrs;
-    }
+    release_video_rgb_stage_buffer();
     if (input_mem_ != nullptr && app_ctx.rknn_ctx != 0) {
         rknn_destroy_mem(app_ctx.rknn_ctx, input_mem_);
         input_mem_ = nullptr;
+    }
+    if (app_ctx.rknn_ctx != 0) {
+        rknn_destroy(app_ctx.rknn_ctx);
+        app_ctx.rknn_ctx = 0;
+    }
+    if (app_ctx.input_attrs != nullptr) {
+        delete[] app_ctx.input_attrs;
+        app_ctx.input_attrs = nullptr;
+    }
+    if (app_ctx.output_attrs != nullptr) {
+        delete[] app_ctx.output_attrs;
+        app_ctx.output_attrs = nullptr;
     }
     clear_video_dmabuf_frame();
     if (bytetrack_ != nullptr) {
@@ -634,7 +657,132 @@ bool rknn_lite::upload_rgb_to_input_mem(const cv::Mat& rgb_image) {
     return true;
 }
 
+bool rknn_lite::upload_rgb_fd_to_input_mem(int fd, int width, int height, int wstride, int hstride) {
+    if (!input_mem_ready_ || !input_mem_ || fd < 0 || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    const int dst_w = app_ctx.model_width;
+    const int dst_h = app_ctx.model_height;
+    const int dst_w_stride = app_ctx.input_attrs[0].w_stride > 0 ? (int)app_ctx.input_attrs[0].w_stride : dst_w;
+    const int dst_h_stride = app_ctx.input_attrs[0].h_stride > 0 ? (int)app_ctx.input_attrs[0].h_stride : dst_h;
+
+    rga_buffer_t src = wrapbuffer_fd(fd, width, height, RK_FORMAT_RGB_888,
+                                     wstride > 0 ? wstride : width,
+                                     hstride > 0 ? hstride : height);
+    rga_buffer_t dst;
+    if (input_mem_->fd > 0) {
+        dst = wrapbuffer_fd(input_mem_->fd, dst_w, dst_h, RK_FORMAT_RGB_888, dst_w_stride, dst_h_stride);
+    } else {
+        dst = wrapbuffer_virtualaddr(input_mem_->virt_addr, dst_w, dst_h, RK_FORMAT_RGB_888, dst_w_stride, dst_h_stride);
+    }
+
+    IM_STATUS status = IM_STATUS_SUCCESS;
+    if (width != dst_w || height != dst_h) {
+        status = imresize(src, dst);
+    } else {
+        status = improcess(src, dst,
+                           wrapbuffer_virtualaddr(nullptr, 0, 0, RK_FORMAT_RGBA_8888),
+                           im_rect{0, 0, width, height},
+                           im_rect{0, 0, dst_w, dst_h},
+                           im_rect{0, 0, 0, 0}, IM_SYNC);
+    }
+    return status == IM_STATUS_SUCCESS || status == IM_STATUS_NOERROR;
+}
+
+void rknn_lite::release_video_rgb_stage_buffer() {
+    if (video_rgb_stage_buffer_.buffer) {
+        mpp_buffer_put(video_rgb_stage_buffer_.buffer);
+    }
+    video_rgb_stage_buffer_ = VideoRgbStageBuffer{};
+}
+
+bool rknn_lite::ensure_video_rgb_stage_buffer(int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+
+    if (video_rgb_stage_buffer_.buffer &&
+        video_rgb_stage_buffer_.width == width &&
+        video_rgb_stage_buffer_.height == height &&
+        video_rgb_stage_buffer_.wstride == width &&
+        video_rgb_stage_buffer_.hstride == height &&
+        video_rgb_stage_buffer_.fd >= 0) {
+        return true;
+    }
+
+    release_video_rgb_stage_buffer();
+
+    const int stage_size = width * height * 3;
+    MPP_RET ret = mpp_buffer_get(nullptr, &video_rgb_stage_buffer_.buffer, stage_size);
+    if (ret != MPP_OK || !video_rgb_stage_buffer_.buffer) {
+        release_video_rgb_stage_buffer();
+        return false;
+    }
+
+    video_rgb_stage_buffer_.fd = mpp_buffer_get_fd(video_rgb_stage_buffer_.buffer);
+    video_rgb_stage_buffer_.ptr = mpp_buffer_get_ptr(video_rgb_stage_buffer_.buffer);
+    video_rgb_stage_buffer_.size = stage_size;
+    video_rgb_stage_buffer_.width = width;
+    video_rgb_stage_buffer_.height = height;
+    video_rgb_stage_buffer_.wstride = width;
+    video_rgb_stage_buffer_.hstride = height;
+
+    if (video_rgb_stage_buffer_.fd < 0) {
+        release_video_rgb_stage_buffer();
+        return false;
+    }
+
+    return true;
+}
+
+bool rknn_lite::preprocess_video_dmabuf_via_rgb_stage() {
+    if (!video_dmabuf_frame_.valid || video_dmabuf_frame_.fd < 0 ||
+        video_dmabuf_frame_.width <= 0 || video_dmabuf_frame_.height <= 0 ||
+        video_dmabuf_frame_.wstride <= 0 || video_dmabuf_frame_.hstride <= 0 ||
+        video_dmabuf_frame_.drm_format != DRM_FORMAT_NV12) {
+        return false;
+    }
+
+    if (!ensure_video_rgb_stage_buffer(video_dmabuf_frame_.width, video_dmabuf_frame_.height)) {
+        return false;
+    }
+
+    rga_buffer_t src = wrapbuffer_fd(video_dmabuf_frame_.fd,
+                                     video_dmabuf_frame_.width,
+                                     video_dmabuf_frame_.height,
+                                     RK_FORMAT_YCbCr_420_SP,
+                                     video_dmabuf_frame_.wstride,
+                                     video_dmabuf_frame_.hstride);
+    rga_buffer_t stage = wrapbuffer_fd(video_rgb_stage_buffer_.fd,
+                                       video_rgb_stage_buffer_.width,
+                                       video_rgb_stage_buffer_.height,
+                                       RK_FORMAT_RGB_888,
+                                       video_rgb_stage_buffer_.wstride,
+                                       video_rgb_stage_buffer_.hstride);
+
+    IM_STATUS status = imcvtcolor(src, stage, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        return false;
+    }
+
+    int log_idx = g_preprocess_video_iomem_log_counter.fetch_add(1) + 1;
+    if ((log_idx % 120) == 0) {
+        printf("[Preprocess] video drm_fd -> RGA csc -> rgb_stage (%dx%d stride=%dx%d)\n",
+               video_dmabuf_frame_.width, video_dmabuf_frame_.height,
+               video_dmabuf_frame_.wstride, video_dmabuf_frame_.hstride);
+    }
+
+    return upload_rgb_fd_to_input_mem(video_rgb_stage_buffer_.fd,
+                                      video_rgb_stage_buffer_.width,
+                                      video_rgb_stage_buffer_.height,
+                                      video_rgb_stage_buffer_.wstride,
+                                      video_rgb_stage_buffer_.hstride);
+}
+
 bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
+    if (g_preprocess_video_iomem_disabled.load()) {
+        return preprocess_video_dmabuf_via_rgb_stage();
+    }
+
     auto log_video_iomem_fail = [&](const char* reason, int extra = 0) {
         int fail_idx = g_preprocess_video_iomem_fail_counter.fetch_add(1) + 1;
         if (fail_idx <= 10 || (fail_idx % 120) == 0) {
@@ -648,6 +796,13 @@ bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
                    video_dmabuf_frame_.wstride,
                    video_dmabuf_frame_.hstride,
                    extra);
+        }
+    };
+    auto disable_video_iomem = [&](const char* reason) {
+        bool expected = false;
+        if (g_preprocess_video_iomem_disabled.compare_exchange_strong(expected, true)) {
+            printf("[Preprocess] disable direct video drm_fd -> input_mem after %s, fallback to two-stage RGA path\n",
+                   reason);
         }
     };
 
@@ -665,15 +820,12 @@ bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
     const int dst_w_stride = app_ctx.input_attrs[0].w_stride > 0 ? (int)app_ctx.input_attrs[0].w_stride : dst_w;
     const int dst_h_stride = app_ctx.input_attrs[0].h_stride > 0 ? (int)app_ctx.input_attrs[0].h_stride : dst_h;
 
-    rga_buffer_handle_t src_handle = importbuffer_fd(video_dmabuf_frame_.fd, video_dmabuf_frame_.size);
-    if (!src_handle) {
-        log_video_iomem_fail("importbuffer_fd");
-        return false;
-    }
-
-    rga_buffer_t src = wrapbuffer_handle(src_handle, video_dmabuf_frame_.width, video_dmabuf_frame_.height, RK_FORMAT_YCbCr_420_SP);
-    src.wstride = video_dmabuf_frame_.wstride;
-    src.hstride = video_dmabuf_frame_.hstride;
+    rga_buffer_t src = wrapbuffer_fd(video_dmabuf_frame_.fd,
+                                     video_dmabuf_frame_.width,
+                                     video_dmabuf_frame_.height,
+                                     RK_FORMAT_YCbCr_420_SP,
+                                     video_dmabuf_frame_.wstride,
+                                     video_dmabuf_frame_.hstride);
 
     rga_buffer_t dst;
     if (input_mem_->fd > 0) {
@@ -686,9 +838,9 @@ bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
     im_rect dst_rect = {0, 0, dst_w, dst_h};
     int check = imcheck(src, dst, src_rect, dst_rect);
     if (check != IM_STATUS_SUCCESS && check != IM_STATUS_NOERROR) {
-        releasebuffer_handle(src_handle);
         log_video_iomem_fail("imcheck", check);
-        return false;
+        disable_video_iomem("imcheck");
+        return preprocess_video_dmabuf_via_rgb_stage();
     }
 
     IM_STATUS status = improcess(src, dst,
@@ -696,10 +848,10 @@ bool rknn_lite::preprocess_video_dmabuf_to_input_mem() {
                                  im_rect{0, 0, video_dmabuf_frame_.width, video_dmabuf_frame_.height},
                                  im_rect{0, 0, dst_w, dst_h},
                                  im_rect{0, 0, 0, 0}, IM_SYNC);
-    releasebuffer_handle(src_handle);
     if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
         log_video_iomem_fail("improcess", status);
-        return false;
+        disable_video_iomem("improcess");
+        return preprocess_video_dmabuf_via_rgb_stage();
     }
 
     int log_idx = g_preprocess_video_iomem_log_counter.fetch_add(1) + 1;
@@ -1158,7 +1310,7 @@ int rknn_lite::interf() {
     float scale_h = (float)app_ctx.model_height / ori_img.rows;
 
     object_detect_result_list od_results;
-    post_process(&app_ctx, outputs, detection_threshold, NMS_THRESH, scale_w, scale_h, &od_results);
+    post_process(&app_ctx, outputs, detection_threshold.load(), NMS_THRESH, scale_w, scale_h, &od_results);
     last_detection_count = od_results.count;
 
     last_tracks_.clear();
@@ -1224,13 +1376,13 @@ void rknn_lite::set_use_tracker(bool use) {
 void rknn_lite::set_detection_threshold(float threshold) {
     if (threshold < 0.0f) threshold = 0.0f;
     if (threshold > 1.0f) threshold = 1.0f;
-    detection_threshold = threshold;
+    detection_threshold.store(threshold);
     printf("[Threshold] 置信度阈值已设置为: %.2f\n", threshold);
 }
 
 // 获取检测置信度阈值
 float rknn_lite::get_detection_threshold() {
-    return detection_threshold;
+    return detection_threshold.load();
 }
 
 // 设置标签文件覆盖路径（空字符串表示使用默认标签）
@@ -1450,7 +1602,7 @@ int rknn_lite::interf_detect_only() {
     float scale_h = (float)app_ctx.model_height / ori_img.rows;
     
     object_detect_result_list od_results;
-    post_process(&app_ctx, outputs, detection_threshold, NMS_THRESH, scale_w, scale_h, &od_results);
+    post_process(&app_ctx, outputs, detection_threshold.load(), NMS_THRESH, scale_w, scale_h, &od_results);
     last_detection_count = od_results.count;
 
     last_tracks_.clear();
