@@ -19,7 +19,6 @@ bool acquire_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
                           cv::Mat* frame_out,
                           CameraDmabufFrameInfo* frame_info) {
     if (!frame_out) return false;
-    frame_out->release();
     if (frame_info) {
         *frame_info = CameraDmabufFrameInfo{};
     }
@@ -48,13 +47,17 @@ bool acquire_camera_frame(v4l2_dmabuf::CaptureContext* dmabuf_cap,
             }
             return !frame_out->empty();
         }
+        frame_out->release();
         return false;
     }
 
     if (cv_cap && cv_cap->isOpened()) {
-        return cv_cap->read(*frame_out) && !frame_out->empty();
+        bool ok = cv_cap->read(*frame_out) && !frame_out->empty();
+        if (!ok) frame_out->release();
+        return ok;
     }
 
+    frame_out->release();
     return false;
 }
 

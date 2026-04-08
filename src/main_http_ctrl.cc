@@ -23,6 +23,8 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <cctype>
+#include <cstdint>
 
 // OpenCV
 #include <opencv2/core/core.hpp>
@@ -329,6 +331,181 @@ long get_process_rss_kb() {
         }
     }
     return -1;
+}
+
+struct CpuTimes {
+    uint64_t user = 0;
+    uint64_t nice = 0;
+    uint64_t system = 0;
+    uint64_t idle = 0;
+    uint64_t iowait = 0;
+    uint64_t irq = 0;
+    uint64_t softirq = 0;
+    uint64_t steal = 0;
+};
+
+bool read_cpu_times(CpuTimes* out) {
+    if (!out) return false;
+    std::ifstream ifs("/proc/stat");
+    if (!ifs.is_open()) return false;
+    std::string line;
+    if (!std::getline(ifs, line)) return false;
+    std::istringstream iss(line);
+    std::string cpu_tag;
+    iss >> cpu_tag;
+    if (cpu_tag != "cpu") return false;
+    CpuTimes t;
+    iss >> t.user >> t.nice >> t.system >> t.idle >> t.iowait >> t.irq >> t.softirq >> t.steal;
+    *out = t;
+    return true;
+}
+
+double calc_cpu_usage_percent(const CpuTimes& prev, const CpuTimes& cur) {
+    const uint64_t idle_prev = prev.idle + prev.iowait;
+    const uint64_t idle_cur = cur.idle + cur.iowait;
+    const uint64_t non_idle_prev = prev.user + prev.nice + prev.system + prev.irq + prev.softirq + prev.steal;
+    const uint64_t non_idle_cur = cur.user + cur.nice + cur.system + cur.irq + cur.softirq + cur.steal;
+    const uint64_t total_prev = idle_prev + non_idle_prev;
+    const uint64_t total_cur = idle_cur + non_idle_cur;
+    if (total_cur <= total_prev) return -1.0;
+    const double totald = (double)(total_cur - total_prev);
+    const double idled = (double)(idle_cur - idle_prev);
+    return std::max(0.0, std::min(100.0, (totald - idled) * 100.0 / totald));
+}
+
+double parse_npu_load_percent_text(const std::string& text) {
+    std::vector<double> values;
+    values.reserve(8);
+
+    // 优先解析带 % 的格式，兼容如 "core0: 35%"
+    for (size_t i = 0; i < text.size();) {
+        if (!std::isdigit((unsigned char)text[i])) {
+            ++i;
+            continue;
+        }
+        size_t start = i;
+        while (i < text.size() && std::isdigit((unsigned char)text[i])) ++i;
+        if (i < text.size() && text[i] == '.') {
+            ++i;
+            while (i < text.size() && std::isdigit((unsigned char)text[i])) ++i;
+        }
+        if (i < text.size() && text[i] == '%') {
+            values.push_back(strtod(text.substr(start, i - start).c_str(), nullptr));
+            ++i;
+        }
+    }
+
+    // 回退：不带 % 的纯数字输出（只取 0..100）
+    if (values.empty()) {
+        for (size_t i = 0; i < text.size();) {
+            if (!std::isdigit((unsigned char)text[i])) {
+                ++i;
+                continue;
+            }
+            size_t start = i;
+            while (i < text.size() && std::isdigit((unsigned char)text[i])) ++i;
+            long v = strtol(text.substr(start, i - start).c_str(), nullptr, 10);
+            if (v >= 0 && v <= 100) {
+                values.push_back((double)v);
+            }
+        }
+    }
+
+    if (values.empty()) return -1.0;
+    double sum = 0.0;
+    for (double v : values) sum += v;
+    return sum / (double)values.size();
+}
+
+double read_npu_load_percent() {
+    std::ifstream ifs("/sys/kernel/debug/rknpu/load");
+    if (!ifs.is_open()) return -1.0;
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (content.empty()) return -1.0;
+    return parse_npu_load_percent_text(content);
+}
+
+void usage_monitor_loop() {
+    const auto sample_interval = std::chrono::seconds(1);
+    const auto report_window = std::chrono::seconds(10);
+    auto next_report = std::chrono::steady_clock::now() + report_window;
+
+    CpuTimes prev_cpu;
+    bool has_prev_cpu = read_cpu_times(&prev_cpu);
+    bool npu_warned = false;
+    std::vector<double> cpu_samples;
+    std::vector<double> npu_samples;
+    cpu_samples.reserve(16);
+    npu_samples.reserve(16);
+    long long cv_draw_total_us_window = 0;
+    long long cv_draw_samples_window = 0;
+
+    while (g_running.load()) {
+        std::this_thread::sleep_for(sample_interval);
+        if (!g_running.load()) break;
+
+        CpuTimes cur_cpu;
+        if (read_cpu_times(&cur_cpu)) {
+            if (has_prev_cpu) {
+                double cpu = calc_cpu_usage_percent(prev_cpu, cur_cpu);
+                if (cpu >= 0.0) cpu_samples.push_back(cpu);
+            }
+            prev_cpu = cur_cpu;
+            has_prev_cpu = true;
+        }
+
+        double npu = read_npu_load_percent();
+        if (npu >= 0.0) {
+            npu_samples.push_back(npu);
+        } else if (!npu_warned) {
+            printf("[Usage] 警告: 无法读取 NPU 负载(/sys/kernel/debug/rknpu/load)\n");
+            npu_warned = true;
+        }
+
+        long long cv_sum_us = g_opencv_draw_total_us.exchange(0, std::memory_order_relaxed);
+        long long cv_cnt = g_opencv_draw_sample_count.exchange(0, std::memory_order_relaxed);
+        if (cv_sum_us > 0 && cv_cnt > 0) {
+            cv_draw_total_us_window += cv_sum_us;
+            cv_draw_samples_window += cv_cnt;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            auto calc_avg = [](const std::vector<double>& samples) -> double {
+                if (samples.empty()) return -1.0;
+                double s = 0.0;
+                for (double v : samples) s += v;
+                return s / (double)samples.size();
+            };
+            double cpu_avg = calc_avg(cpu_samples);
+            double npu_avg = calc_avg(npu_samples);
+            double cv_draw_avg_ms = (cv_draw_samples_window > 0)
+                                        ? (double)cv_draw_total_us_window / (double)cv_draw_samples_window / 1000.0
+                                        : -1.0;
+            auto metric_percent = [](double value) -> std::string {
+                if (value < 0.0) return "N/A";
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.1f%%", value);
+                return std::string(buf);
+            };
+            auto metric_ms = [](double value) -> std::string {
+                if (value < 0.0) return "N/A";
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.2fms/帧", value);
+                return std::string(buf);
+            };
+            std::string cpu_text = metric_percent(cpu_avg);
+            std::string npu_text = metric_percent(npu_avg);
+            std::string cv_text = metric_ms(cv_draw_avg_ms);
+            printf("[Usage-10s] CPU平均: %s | NPU平均: %s | OpenCV绘制: %s\n",
+                   cpu_text.c_str(), npu_text.c_str(), cv_text.c_str());
+            cpu_samples.clear();
+            npu_samples.clear();
+            cv_draw_total_us_window = 0;
+            cv_draw_samples_window = 0;
+            next_report = now + report_window;
+        }
+    }
 }
 
 void refresh_rtsp_urls() {
@@ -1606,14 +1783,21 @@ int main(int argc, char** argv) {
     // 读取 RTSP 环境变量（可选）
     const char* env_rtsp_host = getenv("RTSP_HOST");
     const char* env_rtsp_port = getenv("RTSP_PORT");
+    const char* env_rtsp_prebind_dma = getenv("RTSP_PREBIND_DMA");
     const char* env_tracker_backend = getenv("TRACKER_BACKEND");
     const char* env_tracker_reid = getenv("TRACKER_REID_MODEL");
+    bool rtsp_prebind_dma = false;
     if (env_rtsp_host && *env_rtsp_host) {
         g_rtsp_host = env_rtsp_host;
     }
     if (env_rtsp_port && *env_rtsp_port) {
         int p = atoi(env_rtsp_port);
         if (p > 0 && p <= 65535) g_rtsp_port = p;
+    }
+    if (env_rtsp_prebind_dma && *env_rtsp_prebind_dma) {
+        std::string v = env_rtsp_prebind_dma;
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        rtsp_prebind_dma = (v == "1" || v == "true" || v == "on" || v == "yes");
     }
     if (env_tracker_backend && *env_tracker_backend) {
         if (!rknn_lite::set_tracker_backend(env_tracker_backend)) {
@@ -1649,6 +1833,9 @@ int main(int argc, char** argv) {
     print_banner();
     printf("[RTSP] 推流目标: %s | %s | %s\n",
            g_rtsp_url_0.c_str(), g_rtsp_url_1.c_str(), g_rtsp_url_video.c_str());
+    printf("[RTSP] 预绑定 DMA: %s (RTSP_PREBIND_DMA=%s)\n",
+           rtsp_prebind_dma ? "开启" : "关闭",
+           rtsp_prebind_dma ? "1" : "0");
     printf("[Tracker] 默认算法: %s | ReID: %s\n",
            rknn_lite::get_tracker_backend_name().c_str(),
            rknn_lite::resolve_tracker_reid_model().empty() ? "(none)" : rknn_lite::resolve_tracker_reid_model().c_str());
@@ -1738,6 +1925,8 @@ int main(int argc, char** argv) {
     long last_fps_time_ms = time_start.tv_sec * 1000 + time_start.tv_usec / 1000;
     // 启动 HTTP 服务器
     std::thread http_thread(http_server_thread);
+    // 启动 CPU/NPU 使用率监控（每 10s 打印均值）
+    std::thread usage_thread(usage_monitor_loop);
     
     printf("[Main] 流水线已启动\n");
     
@@ -1995,6 +2184,12 @@ int main(int argc, char** argv) {
             bool frame_ok = false;
             bool do_inference = g_inference_enabled.load();
             CameraDmabufFrameInfo camera_frame_info;
+#ifdef USE_RTSP_MPP
+            SlotBgrDmabuf* out_slot = nullptr;
+            if (rtsp_prebind_dma && g_rtsp_streaming.load() && i >= 0 && i < (int)slot_output_buffers.size()) {
+                out_slot = &slot_output_buffers[i];
+            }
+#endif
 
             // 检查是否是视频文件模式
             bool video_mode = g_video_mode.load();
@@ -2007,6 +2202,15 @@ int main(int argc, char** argv) {
                         g_video_mode = false;
                 }
                 if (g_video_running.load() && g_video_mode.load()) {
+#ifdef USE_RTSP_MPP
+                    if (out_slot) {
+                        int vw = g_video_width.load();
+                        int vh = g_video_height.load();
+                        if (vw > 0 && vh > 0 && ensure_slot_bgr_dmabuf(out_slot, vw, vh)) {
+                            frame = out_slot->mat;
+                        }
+                    }
+#endif
                     frame_ok = read_video_frame_locked(frame, &video_frame_info);
                 }
                 if (!frame_ok) {
@@ -2033,6 +2237,22 @@ int main(int argc, char** argv) {
                 // 使用摄像头
                 v4l2_dmabuf::CaptureContext* active_cap = (cam == 0) ? &dmabuf_cap0 : &dmabuf_cap1;
                 cv::VideoCapture* active_cv_cap = (cam == 0) ? &cap0 : &cap1;
+#ifdef USE_RTSP_MPP
+                if (out_slot) {
+                    int cw = 0;
+                    int ch = 0;
+                    if (active_cap && active_cap->fd >= 0 && active_cap->streaming) {
+                        cw = active_cap->width;
+                        ch = active_cap->height;
+                    } else if (active_cv_cap && active_cv_cap->isOpened()) {
+                        cw = (int)active_cv_cap->get(cv::CAP_PROP_FRAME_WIDTH);
+                        ch = (int)active_cv_cap->get(cv::CAP_PROP_FRAME_HEIGHT);
+                    }
+                    if (cw > 0 && ch > 0 && ensure_slot_bgr_dmabuf(out_slot, cw, ch)) {
+                        frame = out_slot->mat;
+                    }
+                }
+#endif
                 frame_ok = acquire_camera_frame(active_cap, active_cv_cap, &frame, &camera_frame_info);
                 if (frame_ok && do_inference && camera_frame_info.valid) {
                     (void)worker->prepare_camera_dmabuf_input(camera_frame_info.fd,
@@ -2052,10 +2272,27 @@ int main(int argc, char** argv) {
             bool bound_dma_output = false;
             if (g_rtsp_streaming.load() && i >= 0 && i < (int)slot_output_buffers.size()) {
                 SlotBgrDmabuf& out = slot_output_buffers[i];
-                if (ensure_slot_bgr_dmabuf(&out, frame.cols, frame.rows)) {
-                    frame.copyTo(out.mat);
-                    worker->ori_img = out.mat;  // inference draw directly on DMA-mapped memory
-                    bound_dma_output = true;
+                if (rtsp_prebind_dma) {
+                    bool same_dma_mat = (out.fd >= 0 &&
+                                         out.width == frame.cols &&
+                                         out.height == frame.rows &&
+                                         out.mat.data == frame.data);
+                    if (same_dma_mat) {
+                        worker->ori_img = frame;
+                        bound_dma_output = true;
+                    } else if (ensure_slot_bgr_dmabuf(&out, frame.cols, frame.rows)) {
+                        if (out.mat.data != frame.data) {
+                            frame.copyTo(out.mat);
+                        }
+                        worker->ori_img = out.mat;  // inference draw directly on DMA-mapped memory
+                        bound_dma_output = true;
+                    }
+                } else {
+                    if (ensure_slot_bgr_dmabuf(&out, frame.cols, frame.rows)) {
+                        frame.copyTo(out.mat);
+                        worker->ori_img = out.mat;  // inference draw directly on DMA-mapped memory
+                        bound_dma_output = true;
+                    }
                 }
             }
             if (!bound_dma_output)
@@ -2154,6 +2391,9 @@ int main(int argc, char** argv) {
     
     printf("[Main] 等待退出...\n");
     http_thread.join();
+    if (usage_thread.joinable()) {
+        usage_thread.join();
+    }
 
     std::string unload_msg;
     if (g_model_loaded.load() || g_active_jobs.load() > 0) {

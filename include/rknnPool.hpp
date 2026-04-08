@@ -147,6 +147,9 @@ static std::atomic<int> g_preprocess_legacy_log_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_fail_counter(0);
 static std::atomic<int> g_preprocess_video_iomem_fallback_counter(0);
 static std::atomic<bool> g_preprocess_video_iomem_disabled(false);
+// OpenCV 绘制耗时累计（供主流程按窗口打印平均值）
+static std::atomic<long long> g_opencv_draw_total_us(0);
+static std::atomic<long long> g_opencv_draw_sample_count(0);
 
 static bool load_labels_from_txt(const std::string& label_path) {
     std::ifstream file(label_path);
@@ -1657,6 +1660,7 @@ int rknn_lite::interf_detect_only() {
     post_process(&app_ctx, outputs, detection_threshold.load(), NMS_THRESH, scale_w, scale_h, &od_results);
     last_detection_count = od_results.count;
 
+    auto opencv_draw_begin = std::chrono::steady_clock::now();
     last_tracks_.clear();
     int drawn_tracker_boxes = 0;
     int drawn_det_boxes = 0;
@@ -1689,11 +1693,18 @@ int rknn_lite::interf_detect_only() {
         }
     }
 
+    long long opencv_draw_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - opencv_draw_begin).count();
+    if (opencv_draw_us < 0) opencv_draw_us = 0;
+    g_opencv_draw_total_us.fetch_add(opencv_draw_us, std::memory_order_relaxed);
+    g_opencv_draw_sample_count.fetch_add(1, std::memory_order_relaxed);
+
     int dbg = infer_debug_counter.fetch_add(1) + 1;
     if ((dbg % 600) == 0) {
-        printf("[Draw infer] det=%d, draw_det=%d, draw_track=%d, backend=%s, use_tracker=%d\n",
+        printf("[Draw infer] det=%d, draw_det=%d, draw_track=%d, backend=%s, use_tracker=%d, opencv=%.2fms\n",
                od_results.count, drawn_det_boxes, drawn_tracker_boxes,
-               tracker_backend_to_string(tracker_backend_).c_str(), use_tracker_this_frame_ ? 1 : 0);
+               tracker_backend_to_string(tracker_backend_).c_str(), use_tracker_this_frame_ ? 1 : 0,
+               (double)opencv_draw_us / 1000.0);
     }
     
     rknn_outputs_release(app_ctx.rknn_ctx, app_ctx.io_num.n_output, outputs);
