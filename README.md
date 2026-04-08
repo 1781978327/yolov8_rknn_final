@@ -139,6 +139,12 @@ TRACKER_REID_MODEL=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK358
 ./rknn_http_ctrl
 ```
 
+关于模型路径的建议：
+
+- 程序默认模型路径是相对路径 `../model/RK3588/yolov8s.rknn`
+- 相对路径是按“服务进程启动时的工作目录”解析，不一定等于项目根目录
+- 如果你看到 `未找到可用模型(.rknn)`，优先在 `/api/inference/on` 中使用绝对路径 `model=...`
+
 摄像头目前默认打开：
 
 - `cam0 -> /dev/video0`
@@ -158,6 +164,52 @@ ls /dev/video*
 ```bash
 BASE=http://127.0.0.1:8091
 ```
+
+### 本地联调最短链路（摄像头 + 推理跟踪 + 抓图 + 推流）
+
+下面这组命令是本机实测可通的最短链路，建议直接复制执行：
+
+```bash
+BASE=http://127.0.0.1:8091
+MODEL=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/RK3588/yolov8s.rknn
+LABELS=/home/orangepi/Desktop/web/yolov8-rk3588-cpp-3-15/model/coco_80_labels_list.txt
+
+# 1) 清理状态并切回摄像头模式
+curl -X POST "$BASE/api/rtsp/stop"
+curl -X POST "$BASE/api/inference/off?unload=1"
+curl -X POST "$BASE/api/video/stop"
+
+# 2) 选摄像头（0 或 1）
+curl -X POST "$BASE/api/camera/0"
+
+# 3) 开推理+跟踪（关键：模型/标签建议用绝对路径）
+curl -X POST -G "$BASE/api/inference/on" \
+  --data-urlencode "track=1" \
+  --data-urlencode "tracker=bytetrack" \
+  --data-urlencode "model=$MODEL" \
+  --data-urlencode "labels=$LABELS"
+
+# 4) 等首帧并抓图
+sleep 1
+curl "$BASE/api/frame?track=1" -o cam0.jpg
+file cam0.jpg
+
+# 5) 开 RTSP 推流
+curl -X POST "$BASE/api/rtsp/start"
+curl "$BASE/api/status"
+```
+
+如果 `cam0.jpg` 不是 JPEG（例如只有几十字节），通常是返回了 JSON 错误信息，可以这样检查：
+
+```bash
+file cam0.jpg
+cat cam0.jpg
+```
+
+常见情况是 `{"status":"error","message":"暂无帧数据",...}`，此时建议：
+
+- 先看 `curl "$BASE/api/status"` 中 `model_loaded` 是否为 `true`
+- 再切到另一只摄像头测试：`curl -X POST "$BASE/api/camera/1"` 后重试抓图
 
 ### 查看状态
 
@@ -306,6 +358,7 @@ curl "$BASE/api/frame?track=1&redraw=1" --output /tmp/frame_track.jpg
 
 - `/api/frame` 只有在视频流或摄像头流已经启动并产生过当前帧时才会返回 JPEG
 - 在空闲态调用 `/api/frame` 会返回 `503` 与 `暂无帧数据`
+- 建议抓图后用 `file /tmp/frame.jpg` 或 `curl -i` 检查 `Content-Type`，避免把错误 JSON 当成 JPG
 - `redraw=1` 是调试开关
 - 推理线程本身已经在 `ori_img` 上画过框
 - 使用 `redraw=1` 可能看到文字或框叠加
