@@ -29,6 +29,9 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <libdrm/drm_fourcc.h>
+#ifdef USE_RTSP_MPP
+#include <rockchip/mpp_buffer.h>
+#endif
 
 // RKNN 相关
 #include "rknnPool.hpp"
@@ -214,6 +217,61 @@ void start_video_rtsp_raw_thread_if_needed() {
         return;
     }
     g_video_rtsp_raw_thread = std::thread(video_rtsp_raw_loop);
+}
+#endif
+
+#ifdef USE_RTSP_MPP
+struct SlotBgrDmabuf {
+    MppBuffer buffer = nullptr;
+    int fd = -1;
+    void* ptr = nullptr;
+    int size = 0;
+    int width = 0;
+    int height = 0;
+    int wstride = 0;
+    int hstride = 0;
+    cv::Mat mat;
+};
+
+static void release_slot_bgr_dmabuf(SlotBgrDmabuf* slot) {
+    if (!slot) return;
+    slot->mat.release();
+    if (slot->buffer) {
+        mpp_buffer_put(slot->buffer);
+    }
+    *slot = SlotBgrDmabuf{};
+}
+
+static bool ensure_slot_bgr_dmabuf(SlotBgrDmabuf* slot, int width, int height) {
+    if (!slot || width <= 0 || height <= 0) return false;
+    if (slot->buffer && slot->ptr && slot->fd >= 0 &&
+        slot->width == width && slot->height == height) {
+        return true;
+    }
+
+    release_slot_bgr_dmabuf(slot);
+
+    const int size = width * height * 3;
+    MPP_RET ret = mpp_buffer_get(nullptr, &slot->buffer, size);
+    if (ret != MPP_OK || !slot->buffer) {
+        release_slot_bgr_dmabuf(slot);
+        return false;
+    }
+
+    slot->fd = mpp_buffer_get_fd(slot->buffer);
+    slot->ptr = mpp_buffer_get_ptr(slot->buffer);
+    if (slot->fd < 0 || slot->ptr == nullptr) {
+        release_slot_bgr_dmabuf(slot);
+        return false;
+    }
+
+    slot->size = size;
+    slot->width = width;
+    slot->height = height;
+    slot->wstride = width;
+    slot->hstride = height;
+    slot->mat = cv::Mat(height, width, CV_8UC3, slot->ptr, (size_t)width * 3);
+    return !slot->mat.empty();
 }
 #endif
 
@@ -1663,6 +1721,9 @@ int main(int argc, char** argv) {
     };
     
     std::vector<SlotState> slot_states(total_slots);
+#ifdef USE_RTSP_MPP
+    std::vector<SlotBgrDmabuf> slot_output_buffers(total_slots);
+#endif
     
     // 初始化跟踪结果向量
     g_tracker_results.resize(total_slots);
@@ -1796,7 +1857,7 @@ int main(int argc, char** argv) {
                 {
                     std::lock_guard<std::mutex> lock(g_model_mutex);
                     if (i < (int)rkpool.size() && rkpool[i]) {
-                        worker_frame = rkpool[i]->ori_img.clone();
+                        worker_frame = rkpool[i]->ori_img;  // shallow copy: avoid clone in hot path
                     }
                 }
                 if (worker_frame.empty()) {
@@ -1823,7 +1884,7 @@ int main(int argc, char** argv) {
                 // RTSP 推流（绘制跟踪框）
 #ifdef USE_RTSP_MPP
                 if (g_rtsp_streaming.load()) {
-                    cv::Mat frame_for_rtsp = worker_frame.clone();
+                    cv::Mat frame_for_rtsp = worker_frame;  // shallow copy: avoid clone in hot path
 
                     bool use_tracker = g_tracker_enabled.load();
                     if (use_tracker) {
@@ -1838,7 +1899,21 @@ int main(int argc, char** argv) {
                     {
                         std::lock_guard<std::mutex> rtsp_lock(g_rtsp_mutex);
                         if (g_video_mode.load() && g_rtsp_sender_video) {
-                            if (g_rtsp_sender_video->push(frame_for_rtsp)) {
+                            bool pushed_ok = false;
+                            if (i >= 0 && i < (int)slot_output_buffers.size()) {
+                                SlotBgrDmabuf& out = slot_output_buffers[i];
+                                if (out.fd >= 0 &&
+                                    out.width == frame_for_rtsp.cols &&
+                                    out.height == frame_for_rtsp.rows &&
+                                    out.mat.data == frame_for_rtsp.data) {
+                                    pushed_ok = g_rtsp_sender_video->push_bgr_dmabuf(
+                                        out.fd, out.width, out.height, out.wstride, out.hstride);
+                                }
+                            }
+                            if (!pushed_ok) {
+                                pushed_ok = g_rtsp_sender_video->push(frame_for_rtsp);
+                            }
+                            if (pushed_ok) {
                                 push0++;
                             } else {
                                 printf("[RTSP] 视频推流写包失败，已自动停止，请重新调用 /api/rtsp/video/start\n");
@@ -1846,7 +1921,21 @@ int main(int argc, char** argv) {
                             }
                         } else if (!g_video_mode.load()) {
                             if (cam == 0 && g_rtsp_sender0) {
-                                if (g_rtsp_sender0->push(frame_for_rtsp)) {
+                                bool pushed_ok = false;
+                                if (i >= 0 && i < (int)slot_output_buffers.size()) {
+                                    SlotBgrDmabuf& out = slot_output_buffers[i];
+                                    if (out.fd >= 0 &&
+                                        out.width == frame_for_rtsp.cols &&
+                                        out.height == frame_for_rtsp.rows &&
+                                        out.mat.data == frame_for_rtsp.data) {
+                                        pushed_ok = g_rtsp_sender0->push_bgr_dmabuf(
+                                            out.fd, out.width, out.height, out.wstride, out.hstride);
+                                    }
+                                }
+                                if (!pushed_ok) {
+                                    pushed_ok = g_rtsp_sender0->push(frame_for_rtsp);
+                                }
+                                if (pushed_ok) {
                                     push0++;
                                 } else {
                                     printf("[RTSP] Cam0 推流写包失败，已自动停止，请重新调用 /api/rtsp/start\n");
@@ -1854,7 +1943,21 @@ int main(int argc, char** argv) {
                                 }
                             }
                             if (cam == 1 && g_rtsp_sender1) {
-                                if (g_rtsp_sender1->push(frame_for_rtsp)) {
+                                bool pushed_ok = false;
+                                if (i >= 0 && i < (int)slot_output_buffers.size()) {
+                                    SlotBgrDmabuf& out = slot_output_buffers[i];
+                                    if (out.fd >= 0 &&
+                                        out.width == frame_for_rtsp.cols &&
+                                        out.height == frame_for_rtsp.rows &&
+                                        out.mat.data == frame_for_rtsp.data) {
+                                        pushed_ok = g_rtsp_sender1->push_bgr_dmabuf(
+                                            out.fd, out.width, out.height, out.wstride, out.hstride);
+                                    }
+                                }
+                                if (!pushed_ok) {
+                                    pushed_ok = g_rtsp_sender1->push(frame_for_rtsp);
+                                }
+                                if (pushed_ok) {
                                     push1++;
                                 } else {
                                     printf("[RTSP] Cam1 推流写包失败，已自动停止，请重新调用 /api/rtsp/start\n");
@@ -1945,7 +2048,21 @@ int main(int argc, char** argv) {
             if (!frame_ok) continue;
 
             g_active_jobs.fetch_add(1);
-            frame.copyTo(worker->ori_img);
+#ifdef USE_RTSP_MPP
+            bool bound_dma_output = false;
+            if (g_rtsp_streaming.load() && i >= 0 && i < (int)slot_output_buffers.size()) {
+                SlotBgrDmabuf& out = slot_output_buffers[i];
+                if (ensure_slot_bgr_dmabuf(&out, frame.cols, frame.rows)) {
+                    frame.copyTo(out.mat);
+                    worker->ori_img = out.mat;  // inference draw directly on DMA-mapped memory
+                    bound_dma_output = true;
+                }
+            }
+            if (!bound_dma_output)
+#endif
+            {
+                frame.copyTo(worker->ori_img);
+            }
             slot_states[i].busy.store(true);
             slot_states[i].ready.store(false);
             slot_states[i].thread_id = std::this_thread::get_id();
@@ -2057,6 +2174,9 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lock(g_rtsp_mutex);
         g_video_rtsp_raw_stop = true;
         stop_rtsp_senders_locked();
+    }
+    for (auto& out : slot_output_buffers) {
+        release_slot_bgr_dmabuf(&out);
     }
 #endif
 

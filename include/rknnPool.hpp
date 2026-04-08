@@ -990,11 +990,11 @@ int rknn_lite::draw_tracker_results(cv::Mat& img, const std::vector<TrackerResul
         if (x2 <= x1 || y2 <= y1) continue;
 
         cv::Scalar color = tracker_color_from_id(track.track_id);
-        cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, box_thickness);
-
         const char* label = (track.label >= 0 && track.label < (int)coco_labels.size())
                             ? coco_labels[track.label].c_str() : "unknown";
         snprintf(text, sizeof(text), "ID:%d %s %.1f%%", track.track_id, label, track.score * 100.0f);
+
+        cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, box_thickness);
 
         int baseLine = 0;
         cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, font_thickness, &baseLine);
@@ -1060,10 +1060,10 @@ int rknn_lite::draw_unmatched_detections(cv::Mat& img, const object_detect_resul
         int y2 = clamp_coord_int(det_y2, img.rows - 1);
         if (x2 <= x1 || y2 <= y1) continue;
 
-        cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
         const char* label = (det->cls_id >= 0 && det->cls_id < (int)coco_labels.size())
                             ? coco_labels[det->cls_id].c_str() : "unknown";
         snprintf(text, sizeof(text), "%s %.1f%%", label, det->prop * 100.0f);
+        cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
         cv::putText(img, text, cv::Point(x1, std::max(0, y1 - 5)),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
         drawn++;
@@ -1389,23 +1389,18 @@ int rknn_lite::interf() {
             int x2 = det_result->box.right;
             int y2 = det_result->box.bottom;
             cv::rectangle(ori_img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(255, 0, 0));
-
             const char* label = (det_result->cls_id >= 0 && det_result->cls_id < (int)coco_labels.size())
                                 ? coco_labels[det_result->cls_id].c_str() : "unknown";
             sprintf(text, "%s %.1f%%", label, det_result->prop * 100);
-
             int baseLine = 0;
             cv::Size label_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
             int tx = x1;
             int ty = y1 - label_size.height - baseLine;
             if (ty < 0) ty = 0;
             if (tx + label_size.width > ori_img.cols) tx = ori_img.cols - label_size.width;
-
             cv::rectangle(ori_img, cv::Rect(cv::Point(tx, ty),
                           cv::Size(label_size.width, label_size.height + baseLine)),
                           cv::Scalar(255, 255, 255), -1);
-
             cv::putText(ori_img, text, cv::Point(tx, ty + label_size.height),
                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0));
         }
@@ -1684,13 +1679,13 @@ int rknn_lite::interf_detect_only() {
             int x1 = det->box.left, y1 = det->box.top;
             int x2 = det->box.right, y2 = det->box.bottom;
             cv::rectangle(ori_img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
-            drawn_det_boxes++;
             const char* label = (det->cls_id >= 0 && det->cls_id < (int)coco_labels.size())
                                 ? coco_labels[det->cls_id].c_str() : "unknown";
             char text[256];
             snprintf(text, sizeof(text), "%s %.1f%%", label, det->prop * 100);
             cv::putText(ori_img, text, cv::Point(x1, y1 - 5),
                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+            drawn_det_boxes++;
         }
     }
 

@@ -636,6 +636,26 @@ bool RtspMppSender::push(cv::Mat& bgr_frame) {
     return true;
 }
 
+bool RtspMppSender::push_bgr_dmabuf(int fd, int width, int height, int wstride, int hstride) {
+    if (!inited_ || !ctx_) return false;
+    MppRtspContext* ctx = (MppRtspContext*)ctx_;
+    int ret = transfer_bgr_fd_frame(ctx, fd, width, height, wstride, hstride);
+    if (ret != 0) {
+        destroy();
+        return false;
+    }
+    ctx->bgr_fd_push_count++;
+    if (ctx->bgr_fd_push_count == 1 || (ctx->bgr_fd_push_count % 600) == 0) {
+        std::cout << "[RTSP-DMA-ZEROCOPY] BGR dma-buf -> RGA -> NV12 -> MPP encoder"
+                  << " frame=" << ctx->bgr_fd_push_count
+                  << " size=" << width << "x" << height
+                  << " stride=" << wstride << "x" << hstride
+                  << " fd=" << fd << std::endl;
+    }
+    av_packet_unref(ctx->packet);
+    return true;
+}
+
 bool RtspMppSender::push_dmabuf(int fd, int size, int width, int height,
                                 int wstride, int hstride, uint32_t drm_format) {
     if (!inited_ || !ctx_) return false;
