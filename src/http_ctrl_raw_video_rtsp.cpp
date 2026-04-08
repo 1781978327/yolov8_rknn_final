@@ -268,11 +268,8 @@ bool ReadRawVideoRtspFrame(RawVideoRtspDecoderContext* ctx,
         bool ok = false;
         if (ctx->frame->format == AV_PIX_FMT_DRM_PRIME) {
             bool dmabuf_ok = frame_info ? ExtractRawVideoDrmPrimeInfo(ctx->frame, frame_info) : false;
-            if (dmabuf_ok) {
-                ok = true;
-            } else if (bgr_frame) {
-                ok = ConvertRawVideoDrmPrimeToBgr(ctx->frame, bgr_frame);
-            }
+            bool bgr_ok = bgr_frame ? ConvertRawVideoDrmPrimeToBgr(ctx->frame, bgr_frame) : false;
+            ok = dmabuf_ok || bgr_ok;
         }
 
         av_frame_unref(ctx->frame);

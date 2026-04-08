@@ -191,7 +191,7 @@ curl -X POST -G "$BASE/api/inference/on" \
 
 # 4) 等首帧并抓图
 sleep 1
-curl "$BASE/api/frame?track=1" -o cam0.jpg
+curl "$BASE/api/frame?track=1&cam=0" -o cam0.jpg
 file cam0.jpg
 
 # 5) 开 RTSP 推流
@@ -209,7 +209,7 @@ cat cam0.jpg
 常见情况是 `{"status":"error","message":"暂无帧数据",...}`，此时建议：
 
 - 先看 `curl "$BASE/api/status"` 中 `model_loaded` 是否为 `true`
-- 再切到另一只摄像头测试：`curl -X POST "$BASE/api/camera/1"` 后重试抓图
+- 再切到另一只摄像头测试：`curl "$BASE/api/frame?track=1&cam=1" -o cam1.jpg`
 
 ### 查看状态
 
@@ -348,6 +348,20 @@ curl $BASE/api/status
 curl "$BASE/api/frame" --output /tmp/frame.jpg
 ```
 
+按摄像头抓图（推荐，避免双路并发时串帧）：
+
+```bash
+curl "$BASE/api/frame?cam=0&track=0" --output /tmp/frame_cam0.jpg
+curl "$BASE/api/frame?cam=1&track=0" --output /tmp/frame_cam1.jpg
+```
+
+也支持 `cameraId` 参数（`1->cam0`, `2->cam1`）：
+
+```bash
+curl "$BASE/api/frame?cameraId=1&track=0" --output /tmp/frame_camera1.jpg
+curl "$BASE/api/frame?cameraId=2&track=0" --output /tmp/frame_camera2.jpg
+```
+
 带调试重绘：
 
 ```bash
@@ -359,9 +373,30 @@ curl "$BASE/api/frame?track=1&redraw=1" --output /tmp/frame_track.jpg
 - `/api/frame` 只有在视频流或摄像头流已经启动并产生过当前帧时才会返回 JPEG
 - 在空闲态调用 `/api/frame` 会返回 `503` 与 `暂无帧数据`
 - 建议抓图后用 `file /tmp/frame.jpg` 或 `curl -i` 检查 `Content-Type`，避免把错误 JSON 当成 JPG
+- 双摄模式建议显式传 `cam=0/1`，保证拿到对应路数画面
 - `redraw=1` 是调试开关
 - 推理线程本身已经在 `ori_img` 上画过框
 - 使用 `redraw=1` 可能看到文字或框叠加
+
+## 禁入区与入侵告警
+
+视觉服务支持从 Spring Boot 拉取禁入区域（四边形），并在画面实时叠加：
+
+- 四边形边线与角点：红色
+- 进入四边形的目标框：红色（`INTR`）
+
+同时会上报入侵事件到 Spring Boot（`type=env_intrusion`），并携带截图。
+
+默认拉取与上报目标（由视觉服务配置）：
+
+- 禁入区拉取：`http://<REPORT_SERVER_HOST>:<REPORT_SERVER_PORT>/api/rknn/forbidden-area?cameraId=1/2`
+- 告警上报：`http://<REPORT_SERVER_HOST>:<REPORT_SERVER_PORT>/api/detection/record/rknn/report`
+
+说明：
+
+- `cameraId=1` 对应视觉 `cam=0`
+- `cameraId=2` 对应视觉 `cam=1`
+- 禁入区同步是轮询方式（默认 2 秒），前端提交后通常 1-2 秒内在画面生效
 
 ## 其他常用接口
 
@@ -389,7 +424,34 @@ curl $BASE/
 - `/api/status` 会返回 `model_loaded`、`video_mode`、`rtsp_streaming`、`tracker_backend`、`tracker_skip_frames` 等完整状态
 - `/api/frame` 在空闲态会返回 `503` 与 `暂无帧数据`
 - `/api/threshold/set` 建议配合 `/api/threshold/get` 立即确认是否生效
+- `/api/frame` 建议显式传 `cam=0/1` 或 `cameraId=1/2`
 - `/api/camera/2` 当前会返回成功，但摄像头 RTSP 仍固定使用 `cam0=/dev/video0`、`cam1=/dev/video2`
+
+## 视觉服务环境变量
+
+常用环境变量：
+
+- `REPORT_SERVER_HOST`：Spring Boot 主机（默认 `127.0.0.1`）
+- `REPORT_SERVER_PORT`：Spring Boot 端口（默认 `8080`）
+- `REPORT_SERVER_PATH`：告警上报路径（默认 `/api/detection/record/rknn/report`）
+- `REPORT_CAM0_ID`：cam0 对应后端 `cameraId`（默认 `1`）
+- `REPORT_CAM1_ID`：cam1 对应后端 `cameraId`（默认 `2`）
+- `BOX_ALERT_COOLDOWN_MS`：框数量告警冷却（默认 `8000`）
+- `FORBIDDEN_AREA_PATH`：禁入区拉取路径（默认 `/api/rknn/forbidden-area`）
+- `FORBIDDEN_AREA_SYNC_MS`：禁入区轮询间隔毫秒（默认 `2000`）
+- `FORBIDDEN_AREA_TIMEOUT_MS`：禁入区拉取超时毫秒（默认 `600`）
+- `INTRUSION_ALERT_COOLDOWN_MS`：入侵告警冷却毫秒（默认 `8000`）
+
+示例：
+
+```bash
+sudo REPORT_SERVER_HOST=127.0.0.1 \
+REPORT_SERVER_PORT=8080 \
+FORBIDDEN_AREA_PATH=/api/rknn/forbidden-area \
+FORBIDDEN_AREA_SYNC_MS=2000 \
+INTRUSION_ALERT_COOLDOWN_MS=8000 \
+./rknn_http_ctrl --port 8091
+```
 
 ## 用 ffplay / ffprobe 验证推流
 

@@ -52,6 +52,15 @@ struct TrackerResultItem {
     std::vector<std::pair<float, float>> trajectory;
 };
 
+struct DetectionResultItem {
+    int label = -1;
+    float score = 0.0f;
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+};
+
 static TrackerBackend g_tracker_backend_override = TrackerBackend::ByteTrack;
 static std::string g_tracker_reid_model_override;
 static int g_deepsort_skip_frames = 0;
@@ -123,6 +132,21 @@ static cv::Scalar tracker_color_from_id(int track_id) {
     return cv::Scalar(b, g, r);
 }
 
+static cv::Scalar tracker_color_from_label(int label) {
+    unsigned int seed = (unsigned int)(label < 0 ? -label : label);
+    int b = 80 + (seed * 29) % 176;
+    int g = 80 + (seed * 43) % 176;
+    int r = 80 + (seed * 71) % 176;
+    return cv::Scalar(b, g, r);
+}
+
+static cv::Scalar tracker_color_for_item(int label, int track_id) {
+    if (label >= 0) {
+        return tracker_color_from_label(label);
+    }
+    return tracker_color_from_id(track_id);
+}
+
 static int clamp_coord_int(float value, int max_value) {
     int ivalue = (int)value;
     if (ivalue < 0) return 0;
@@ -134,6 +158,23 @@ static int sanitize_deepsort_skip_frames(int skip_frames) {
     if (skip_frames < 0) return 0;
     if (skip_frames > 10) return 10;
     return skip_frames;
+}
+
+// 轨迹绘制点数上限（可通过环境变量 TRACK_DRAW_TRAIL_POINTS 调整）
+static int get_track_draw_points_limit() {
+    static int cached_limit = -1;
+    if (cached_limit > 0) return cached_limit;
+
+    int limit = 75;  // 默认约 3 秒轨迹(25fps)
+    const char* env_draw_points = getenv("TRACK_DRAW_TRAIL_POINTS");
+    if (env_draw_points && *env_draw_points) {
+        int v = atoi(env_draw_points);
+        if (v > 0) limit = v;
+    }
+    if (limit < 10) limit = 10;
+    if (limit > 300) limit = 300;
+    cached_limit = limit;
+    return cached_limit;
 }
 
 // FPS 计算变量
@@ -283,6 +324,7 @@ private:
     int video_nv12_height_;  // packed NV12 逻辑高度
     int video_nv12_wstride_;  // packed NV12 stride
     int video_nv12_hstride_;  // packed NV12 height stride
+    int last_detection_count_instance_;  // 当前 worker 最近一次检测框数量
     static std::atomic<float> detection_threshold;  // 置信度阈值
 
 public:
@@ -299,6 +341,8 @@ public:
     void clear_video_dmabuf_frame();
     bool is_tracker_enabled() const { return enable_tracker_; }
     std::vector<TrackerResultItem> get_last_tracks() const { return last_tracks_; }
+    std::vector<DetectionResultItem> get_last_detections() const { return last_detections_; }
+    int get_last_detection_count() const { return last_detection_count_instance_; }
     static void set_detection_threshold(float threshold);  // 设置置信度阈值
     static float get_detection_threshold();  // 获取置信度阈值
     static void set_label_file_override(const std::string& label_file);  // 设置标签txt覆盖路径，空字符串=默认
@@ -329,6 +373,7 @@ private:
     int draw_tracker_results(cv::Mat& img, const std::vector<TrackerResultItem>& tracks);
     int draw_unmatched_detections(cv::Mat& img, const object_detect_result_list& od_results,
                                   const std::vector<TrackerResultItem>& tracks);
+    void cache_last_detections(const object_detect_result_list& od_results);
     std::vector<TrackerResultItem> update_bytetrack(const object_detect_result_list& od_results);
     std::vector<TrackerResultItem> update_deepsort(cv::Mat& img, const object_detect_result_list& od_results);
     BYTETracker* ensure_shared_bytetrack_tracker();
@@ -336,6 +381,7 @@ private:
 
 private:
     std::vector<TrackerResultItem> last_tracks_;  // 最后一帧的跟踪结果
+    std::vector<DetectionResultItem> last_detections_;  // 最后一帧的检测框结果
 };
 
 // 静态成员初始化
@@ -359,6 +405,7 @@ rknn_lite::rknn_lite(char* model_path, int core_id) {
     video_nv12_height_ = 0;
     video_nv12_wstride_ = 0;
     video_nv12_hstride_ = 0;
+    last_detection_count_instance_ = 0;
 
     // 总是启用跟踪器（运行时可通过 API 控制开关）
     enable_tracker_ = true;
@@ -992,7 +1039,7 @@ int rknn_lite::draw_tracker_results(cv::Mat& img, const std::vector<TrackerResul
         int y2 = clamp_coord_int(track.y2, img.rows - 1);
         if (x2 <= x1 || y2 <= y1) continue;
 
-        cv::Scalar color = tracker_color_from_id(track.track_id);
+        cv::Scalar color = tracker_color_for_item(track.label, track.track_id);
         const char* label = (track.label >= 0 && track.label < (int)coco_labels.size())
                             ? coco_labels[track.label].c_str() : "unknown";
         snprintf(text, sizeof(text), "ID:%d %s %.1f%%", track.track_id, label, track.score * 100.0f);
@@ -1012,7 +1059,8 @@ int rknn_lite::draw_tracker_results(cv::Mat& img, const std::vector<TrackerResul
                     cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(255, 255, 255), font_thickness);
 
         const auto& traj = track.trajectory;
-        int start_idx = (traj.size() > 20) ? ((int)traj.size() - 20) : 0;
+        const int draw_trail_points = get_track_draw_points_limit();
+        int start_idx = (traj.size() > (size_t)draw_trail_points) ? ((int)traj.size() - draw_trail_points) : 0;
         for (size_t i = (size_t)start_idx + 1; i < traj.size(); ++i) {
             int px1 = clamp_coord_int(traj[i - 1].first, img.cols - 1);
             int py1 = clamp_coord_int(traj[i - 1].second, img.rows - 1);
@@ -1368,6 +1416,8 @@ int rknn_lite::interf() {
     object_detect_result_list od_results;
     post_process(&app_ctx, outputs, detection_threshold.load(), NMS_THRESH, scale_w, scale_h, &od_results);
     last_detection_count = od_results.count;
+    last_detection_count_instance_ = od_results.count;
+    cache_last_detections(od_results);
 
     last_tracks_.clear();
     int drawn_tracker_boxes = 0;
@@ -1580,6 +1630,23 @@ DeepSort* rknn_lite::ensure_shared_deepsort_tracker() {
     return g_shared_deepsort_trackers[stream_id];
 }
 
+void rknn_lite::cache_last_detections(const object_detect_result_list& od_results) {
+    last_detections_.clear();
+    if (od_results.count <= 0) return;
+    last_detections_.reserve((size_t)od_results.count);
+    for (int i = 0; i < od_results.count; ++i) {
+        const object_detect_result* det = &(od_results.results[i]);
+        DetectionResultItem item;
+        item.label = det->cls_id;
+        item.score = det->prop;
+        item.x1 = (float)det->box.left;
+        item.y1 = (float)det->box.top;
+        item.x2 = (float)det->box.right;
+        item.y2 = (float)det->box.bottom;
+        last_detections_.push_back(item);
+    }
+}
+
 // 仅检测模式：不绘制结果，只返回检测结果
 int rknn_lite::interf_detect_only() {
     static std::atomic<int> infer_debug_counter(0);
@@ -1659,6 +1726,8 @@ int rknn_lite::interf_detect_only() {
     object_detect_result_list od_results;
     post_process(&app_ctx, outputs, detection_threshold.load(), NMS_THRESH, scale_w, scale_h, &od_results);
     last_detection_count = od_results.count;
+    last_detection_count_instance_ = od_results.count;
+    cache_last_detections(od_results);
 
     auto opencv_draw_begin = std::chrono::steady_clock::now();
     last_tracks_.clear();

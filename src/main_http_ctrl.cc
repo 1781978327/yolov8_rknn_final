@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <glob.h>
 #include <thread>
 #include <atomic>
@@ -79,6 +80,7 @@ std::atomic<bool> g_model_loaded(false);
 std::atomic<bool> g_model_loading(false);
 std::atomic<int>  g_current_cam(0);
 std::atomic<int>  g_cam0_fps(0), g_cam1_fps(0);
+std::atomic<int>  g_rtsp_cam0_fps(0), g_rtsp_cam1_fps(0), g_rtsp_video_fps(0);
 std::mutex g_model_mutex;
 std::string g_model_path = DEFAULT_MODEL_PATH;
 std::string g_label_path = "";
@@ -92,11 +94,18 @@ cv::Mat g_latest_frame;
 std::mutex g_latest_frame_mutex;
 std::atomic<bool> g_frame_available(false);
 std::atomic<int> g_latest_frame_slot(-1);  // g_latest_frame 对应的 slot，下游绘制时避免错配
+cv::Mat g_latest_frame_cam[2];
+std::mutex g_latest_frame_cam_mutex[2];
+bool g_frame_available_cam[2] = {false, false};
+int g_latest_frame_slot_cam[2] = {-1, -1};
 
 // 跟踪器相关
 std::atomic<bool> g_tracker_enabled(false);  // 0=关闭, 1=开启
 std::mutex g_tracker_mutex;
 std::vector<std::vector<TrackerResultItem>> g_tracker_results;  // 每个 slot 的跟踪结果
+
+void draw_rtsp_fps_overlay(cv::Mat& frame, int fps_value);
+std::string label_name_for_detection(const DetectionResultItem& det);
 
 // RTSP 推流
 #ifdef USE_RTSP_MPP
@@ -147,6 +156,7 @@ void video_rtsp_raw_loop() {
 
     double fps = decoder.fps;
     if (fps <= 0.0) fps = 25.0;
+    g_rtsp_video_fps.store((int)(fps + 0.5f));
     auto frame_interval = std::chrono::microseconds((int)(1000000.0 / fps));
     auto next_deadline = std::chrono::steady_clock::now();
     int pushed = 0;
@@ -181,7 +191,10 @@ void video_rtsp_raw_loop() {
         {
             std::lock_guard<std::mutex> lock(g_rtsp_mutex);
             if (g_rtsp_sender_video && g_rtsp_sender_video->inited()) {
-                if (frame_info.valid) {
+                if (!frame.empty()) {
+                    draw_rtsp_fps_overlay(frame, g_rtsp_video_fps.load());
+                    pushed_ok = g_rtsp_sender_video->push(frame);
+                } else if (frame_info.valid) {
                     pushed_ok = g_rtsp_sender_video->push_dmabuf(
                         frame_info.fd,
                         frame_info.size,
@@ -190,8 +203,6 @@ void video_rtsp_raw_loop() {
                         frame_info.wstride,
                         frame_info.hstride,
                         frame_info.drm_format);
-                } else if (!frame.empty()) {
-                    pushed_ok = g_rtsp_sender_video->push(frame);
                 }
             }
         }
@@ -211,12 +222,17 @@ void video_rtsp_raw_loop() {
     }
 
     CloseRawVideoRtspDecoder(&decoder);
+    g_rtsp_video_fps.store(0);
     g_video_rtsp_raw_running = false;
 }
 
 void start_video_rtsp_raw_thread_if_needed() {
     if (g_video_rtsp_raw_running.load()) {
         return;
+    }
+    // 线程结束后对象仍可能是 joinable，重新赋值前先回收，避免 std::terminate。
+    if (g_video_rtsp_raw_thread.joinable()) {
+        g_video_rtsp_raw_thread.join();
     }
     g_video_rtsp_raw_thread = std::thread(video_rtsp_raw_loop);
 }
@@ -312,6 +328,37 @@ std::atomic<int> g_video_fps(25);
 std::atomic<float> g_confidence_threshold(0.5f);  // 置信度阈值
 std::atomic<int> g_cam0_detection_count(0);  // 摄像头0检测数量
 std::atomic<int> g_cam1_detection_count(0);  // 摄像头1检测数量
+std::atomic<int> g_box_count_alert_threshold(0);  // 框数量告警阈值（0=关闭）
+std::atomic<int> g_box_count_alert_cooldown_ms(8000);  // 告警冷却时间
+
+std::mutex g_box_alert_state_mutex;
+bool g_box_count_over_state[2] = {false, false};
+long long g_last_box_alert_ms[2] = {0, 0};
+
+std::string g_report_server_host = "127.0.0.1";
+int g_report_server_port = 8080;
+std::string g_report_server_path = "/api/detection/record/rknn/report";
+int g_report_camera_id_cam0 = 1;
+int g_report_camera_id_cam1 = 2;
+std::string g_forbidden_area_path = "/api/rknn/forbidden-area";
+std::atomic<int> g_forbidden_area_fetch_interval_ms(2000);
+std::atomic<int> g_forbidden_area_fetch_timeout_ms(600);
+std::atomic<int> g_intrusion_alert_cooldown_ms(8000);
+
+struct ForbiddenAreaCache {
+    bool valid = false;
+    int image_width = 0;
+    int image_height = 0;
+    std::vector<cv::Point2f> points;
+    long long last_fetch_ms = 0;
+};
+
+std::mutex g_forbidden_area_mutex;
+ForbiddenAreaCache g_forbidden_area_cache[2];
+bool g_forbidden_area_fetching[2] = {false, false};
+std::mutex g_intrusion_alert_state_mutex;
+bool g_intrusion_over_state[2] = {false, false};
+long long g_last_intrusion_alert_ms[2] = {0, 0};
 
 // 当前帧的图像尺寸（用于坐标转换）
 cv::Size g_current_img_size(1280, 720);  // 默认值
@@ -331,6 +378,31 @@ long get_process_rss_kb() {
         }
     }
     return -1;
+}
+
+void draw_rtsp_fps_overlay(cv::Mat& frame, int fps_value) {
+    if (frame.empty()) return;
+    if (fps_value < 0) fps_value = 0;
+    char text[64];
+    snprintf(text, sizeof(text), "FPS: %d", fps_value);
+
+    int baseline = 0;
+    const double font_scale = 0.8;
+    const int thickness = 2;
+    cv::Size text_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
+    const int pad = 6;
+    const int tx = 10;
+    const int ty = 10 + text_size.height;
+    int bx = std::max(0, tx - pad);
+    int by = std::max(0, ty - text_size.height - pad);
+    int bw = text_size.width + pad * 2;
+    int bh = text_size.height + baseline + pad * 2;
+    if (bx + bw > frame.cols) bw = std::max(1, frame.cols - bx);
+    if (by + bh > frame.rows) bh = std::max(1, frame.rows - by);
+
+    cv::rectangle(frame, cv::Rect(bx, by, bw, bh), cv::Scalar(0, 0, 0), -1);
+    cv::putText(frame, text, cv::Point(tx, ty),
+                cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 255, 0), thickness);
 }
 
 struct CpuTimes {
@@ -539,14 +611,766 @@ bool file_exists(const std::string& path) {
 std::string parse_query_param(const std::string& path, const std::string& key) {
     size_t qpos = path.find('?');
     if (qpos == std::string::npos) return "";
-    std::string query = path.substr(qpos + 1);
-    std::string needle = key + "=";
-    size_t pos = query.find(needle);
-    if (pos == std::string::npos) return "";
-    size_t value_start = pos + needle.size();
-    size_t value_end = query.find('&', value_start);
-    std::string raw = query.substr(value_start, value_end == std::string::npos ? std::string::npos : (value_end - value_start));
-    return url_decode(raw);
+    const std::string query = path.substr(qpos + 1);
+    size_t start = 0;
+    while (start <= query.size()) {
+        size_t end = query.find('&', start);
+        std::string part = query.substr(start, end == std::string::npos ? std::string::npos : (end - start));
+        size_t eq = part.find('=');
+        if (eq != std::string::npos) {
+            std::string part_key = part.substr(0, eq);
+            if (part_key == key) {
+                std::string raw = part.substr(eq + 1);
+                return url_decode(raw);
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return "";
+}
+
+long long monotonic_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string local_time_iso8601() {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_local;
+    localtime_r(&now, &tm_local);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm_local);
+    return std::string(buf);
+}
+
+void update_latest_frame_global(const cv::Mat& frame, int slot) {
+    if (frame.empty()) return;
+    std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
+    g_latest_frame = frame.clone();
+    g_frame_available = !g_latest_frame.empty();
+    g_latest_frame_slot = slot;
+}
+
+void update_latest_frame_for_cam(int cam, const cv::Mat& frame, int slot) {
+    if (cam < 0 || cam > 1) return;
+    if (frame.empty()) return;
+    std::lock_guard<std::mutex> lock(g_latest_frame_cam_mutex[cam]);
+    g_latest_frame_cam[cam] = frame.clone();
+    g_frame_available_cam[cam] = !g_latest_frame_cam[cam].empty();
+    g_latest_frame_slot_cam[cam] = slot;
+}
+
+std::string base64_encode_bytes(const unsigned char* data, size_t len) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = ((uint32_t)data[i]) << 16;
+        bool has_b1 = (i + 1 < len);
+        bool has_b2 = (i + 2 < len);
+        if (has_b1) v |= ((uint32_t)data[i + 1]) << 8;
+        if (has_b2) v |= (uint32_t)data[i + 2];
+
+        out.push_back(table[(v >> 18) & 0x3F]);
+        out.push_back(table[(v >> 12) & 0x3F]);
+        out.push_back(has_b1 ? table[(v >> 6) & 0x3F] : '=');
+        out.push_back(has_b2 ? table[v & 0x3F] : '=');
+    }
+    return out;
+}
+
+bool send_all_bytes(int sock, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock, data + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += (size_t)n;
+    }
+    return true;
+}
+
+int parse_http_status_code(const std::string& response) {
+    size_t line_end = response.find("\r\n");
+    std::string first_line = (line_end == std::string::npos) ? response : response.substr(0, line_end);
+    size_t sp1 = first_line.find(' ');
+    if (sp1 == std::string::npos) return -1;
+    size_t sp2 = first_line.find(' ', sp1 + 1);
+    std::string code_text = first_line.substr(sp1 + 1, (sp2 == std::string::npos) ? std::string::npos : (sp2 - sp1 - 1));
+    char* endptr = nullptr;
+    long code = strtol(code_text.c_str(), &endptr, 10);
+    if (endptr == code_text.c_str() || *endptr != '\0') return -1;
+    return (int)code;
+}
+
+bool http_request_to_report_server(
+    const std::string& method,
+    const std::string& request_path,
+    const std::string& content_type,
+    const std::string& body,
+    int timeout_ms,
+    std::string* response_head,
+    std::string* response_body,
+    int* status_code_out) {
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return false;
+    }
+
+    if (timeout_ms < 100) timeout_ms = 100;
+    struct timeval timeout;
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons((uint16_t)g_report_server_port);
+
+    if (inet_pton(AF_INET, g_report_server_host.c_str(), &serv_addr.sin_addr) <= 0) {
+        struct hostent* server = gethostbyname(g_report_server_host.c_str());
+        if (server == nullptr || server->h_length <= 0) {
+            close(sock);
+            return false;
+        }
+        memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, (size_t)server->h_length);
+    }
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        return false;
+    }
+
+    std::string path = request_path;
+    if (path.empty()) path = "/";
+    if (path[0] != '/') {
+        path = "/" + path;
+    }
+
+    std::ostringstream oss;
+    oss << method << " " << path << " HTTP/1.1\r\n";
+    oss << "Host: " << g_report_server_host << ":" << g_report_server_port << "\r\n";
+    if (!content_type.empty()) {
+        oss << "Content-Type: " << content_type << "\r\n";
+    }
+    if (!body.empty()) {
+        oss << "Content-Length: " << body.size() << "\r\n";
+    }
+    oss << "Connection: close\r\n\r\n";
+    if (!body.empty()) {
+        oss << body;
+    }
+    const std::string req = oss.str();
+
+    bool sent_ok = send_all_bytes(sock, req.data(), req.size());
+    if (!sent_ok) {
+        close(sock);
+        return false;
+    }
+
+    std::string response;
+    char resp_buf[2048];
+    while (true) {
+        int n = recv(sock, resp_buf, sizeof(resp_buf), 0);
+        if (n <= 0) break;
+        response.append(resp_buf, (size_t)n);
+    }
+    close(sock);
+
+    if (response.empty()) return false;
+    if (response_head) {
+        size_t head_end = response.find("\r\n\r\n");
+        *response_head = response.substr(0, head_end == std::string::npos ? std::min((size_t)256, response.size()) : head_end);
+    }
+    if (response_body) {
+        size_t body_pos = response.find("\r\n\r\n");
+        *response_body = (body_pos == std::string::npos) ? "" : response.substr(body_pos + 4);
+    }
+
+    int status_code = parse_http_status_code(response);
+    if (status_code_out) {
+        *status_code_out = status_code;
+    }
+    return status_code >= 200 && status_code < 300;
+}
+
+bool post_json_to_report_server(const std::string& body, std::string* response_head) {
+    int status_code = -1;
+    return http_request_to_report_server(
+        "POST",
+        g_report_server_path,
+        "application/json",
+        body,
+        3000,
+        response_head,
+        nullptr,
+        &status_code);
+}
+
+void report_detection_count_alert_worker(int cam_id, int detection_count, int threshold, cv::Mat frame_bgr) {
+    if (frame_bgr.empty()) return;
+
+    std::vector<uchar> jpg_buf;
+    if (!cv::imencode(".jpg", frame_bgr, jpg_buf, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+        printf("[AlertReport] JPEG 编码失败: cam=%d count=%d\n", cam_id, detection_count);
+        return;
+    }
+
+    std::string image_b64 = base64_encode_bytes(jpg_buf.data(), jpg_buf.size());
+    int camera_id = (cam_id == 0) ? g_report_camera_id_cam0 : g_report_camera_id_cam1;
+
+    std::ostringstream detection_result;
+    detection_result << "{\"type\":\"box_count_exceeded\",\"cam\":" << cam_id
+                     << ",\"count\":" << detection_count
+                     << ",\"threshold\":" << threshold << "}";
+
+    std::ostringstream body;
+    body << "{";
+    body << "\"cameraId\":" << camera_id << ",";
+    body << "\"detectionTime\":\"" << local_time_iso8601() << "\",";
+    body << "\"detectionResult\":\"" << json_escape(detection_result.str()) << "\",";
+    body << "\"imageBase64\":\"" << image_b64 << "\"";
+    body << "}";
+
+    std::string response_head;
+    bool ok = post_json_to_report_server(body.str(), &response_head);
+    if (ok) {
+        printf("[AlertReport] 上报成功: cam=%d cameraId=%d count=%d threshold=%d\n",
+               cam_id, camera_id, detection_count, threshold);
+    } else {
+        std::string brief = response_head.empty() ? "(no response)" : response_head.substr(0, 120);
+        printf("[AlertReport] 上报失败: cam=%d cameraId=%d count=%d threshold=%d resp=%s\n",
+               cam_id, camera_id, detection_count, threshold, brief.c_str());
+    }
+}
+
+void report_detection_count_alert_async(int cam_id, int detection_count, int threshold, const cv::Mat& frame_bgr) {
+    if (frame_bgr.empty()) return;
+    cv::Mat frame_copy = frame_bgr.clone();
+    if (frame_copy.empty()) return;
+    try {
+        std::thread(report_detection_count_alert_worker, cam_id, detection_count, threshold, frame_copy).detach();
+    } catch (...) {
+        printf("[AlertReport] 启动上报线程失败: cam=%d count=%d\n", cam_id, detection_count);
+    }
+}
+
+void maybe_trigger_detection_count_alert(int cam_id, int detection_count, const cv::Mat& frame_bgr) {
+    if (cam_id < 0 || cam_id > 1) return;
+
+    int threshold = g_box_count_alert_threshold.load();
+    if (threshold <= 0) {
+        std::lock_guard<std::mutex> lock(g_box_alert_state_mutex);
+        g_box_count_over_state[cam_id] = false;
+        return;
+    }
+
+    bool should_report = false;
+    {
+        std::lock_guard<std::mutex> lock(g_box_alert_state_mutex);
+        bool over = detection_count > threshold;
+        bool was_over = g_box_count_over_state[cam_id];
+        g_box_count_over_state[cam_id] = over;
+        if (!over || was_over) {
+            return;
+        }
+
+        long long now_ms = monotonic_now_ms();
+        int cooldown_ms = g_box_count_alert_cooldown_ms.load();
+        if (cooldown_ms < 0) cooldown_ms = 0;
+        if (now_ms - g_last_box_alert_ms[cam_id] < cooldown_ms) {
+            return;
+        }
+        g_last_box_alert_ms[cam_id] = now_ms;
+        should_report = true;
+    }
+
+    if (should_report) {
+        report_detection_count_alert_async(cam_id, detection_count, threshold, frame_bgr);
+    }
+}
+
+bool json_extract_int_after_key(const std::string& text, size_t key_pos, int* out) {
+    if (!out || key_pos == std::string::npos) return false;
+    size_t colon = text.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+    bool neg = false;
+    if (i < text.size() && text[i] == '-') {
+        neg = true;
+        ++i;
+    }
+    if (i >= text.size() || !std::isdigit((unsigned char)text[i])) return false;
+    long value = 0;
+    while (i < text.size() && std::isdigit((unsigned char)text[i])) {
+        value = value * 10 + (text[i] - '0');
+        ++i;
+    }
+    if (neg) value = -value;
+    *out = (int)value;
+    return true;
+}
+
+bool json_extract_int_field(const std::string& text, const std::string& key, int* out) {
+    std::string token = "\"" + key + "\"";
+    size_t key_pos = text.find(token);
+    if (key_pos == std::string::npos) return false;
+    return json_extract_int_after_key(text, key_pos, out);
+}
+
+bool json_extract_bool_field(const std::string& text, const std::string& key, bool* out) {
+    if (!out) return false;
+    std::string token = "\"" + key + "\"";
+    size_t key_pos = text.find(token);
+    if (key_pos == std::string::npos) return false;
+    size_t colon = text.find(':', key_pos);
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+    if (text.compare(i, 4, "true") == 0) {
+        *out = true;
+        return true;
+    }
+    if (text.compare(i, 5, "false") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+bool parse_points_from_forbidden_area_body(const std::string& body, std::vector<cv::Point2f>* points_out) {
+    if (!points_out) return false;
+    points_out->clear();
+
+    size_t key_pos = body.find("\"points\"");
+    if (key_pos == std::string::npos) return false;
+    size_t arr_begin = body.find('[', key_pos);
+    if (arr_begin == std::string::npos) return false;
+
+    size_t depth = 0;
+    size_t arr_end = std::string::npos;
+    for (size_t i = arr_begin; i < body.size(); ++i) {
+        if (body[i] == '[') ++depth;
+        else if (body[i] == ']') {
+            if (depth == 0) return false;
+            --depth;
+            if (depth == 0) {
+                arr_end = i;
+                break;
+            }
+        }
+    }
+    if (arr_end == std::string::npos) return false;
+
+    std::string arr_text = body.substr(arr_begin + 1, arr_end - arr_begin - 1);
+    size_t cursor = 0;
+    while (cursor < arr_text.size()) {
+        size_t x_pos = arr_text.find("\"x\"", cursor);
+        if (x_pos == std::string::npos) break;
+        int x = 0;
+        if (!json_extract_int_after_key(arr_text, x_pos, &x)) {
+            cursor = x_pos + 3;
+            continue;
+        }
+        size_t y_pos = arr_text.find("\"y\"", x_pos);
+        if (y_pos == std::string::npos) break;
+        int y = 0;
+        if (!json_extract_int_after_key(arr_text, y_pos, &y)) {
+            cursor = y_pos + 3;
+            continue;
+        }
+        points_out->push_back(cv::Point2f((float)x, (float)y));
+        cursor = y_pos + 3;
+    }
+    return !points_out->empty();
+}
+
+int forbidden_area_camera_id_from_cam(int cam_id) {
+    return (cam_id == 0) ? 1 : 2;
+}
+
+bool fetch_forbidden_area_from_server(int cam_id, ForbiddenAreaCache* cache_out, std::string* err_msg) {
+    if (!cache_out) return false;
+    *cache_out = ForbiddenAreaCache{};
+    cache_out->last_fetch_ms = monotonic_now_ms();
+
+    std::string path = g_forbidden_area_path;
+    if (path.empty()) path = "/api/rknn/forbidden-area";
+    if (path[0] != '/') path = "/" + path;
+    path += (path.find('?') == std::string::npos) ? "?" : "&";
+    path += "cameraId=" + std::to_string(forbidden_area_camera_id_from_cam(cam_id));
+
+    std::string response_head;
+    std::string response_body;
+    int status_code = -1;
+    int timeout_ms = g_forbidden_area_fetch_timeout_ms.load();
+    bool ok = http_request_to_report_server("GET", path, "application/json", "",
+                                            timeout_ms, &response_head, &response_body, &status_code);
+    if (!ok) {
+        if (err_msg) {
+            std::ostringstream oss;
+            oss << "HTTP fail status=" << status_code << " head="
+                << (response_head.empty() ? "(empty)" : response_head.substr(0, 120));
+            *err_msg = oss.str();
+        }
+        return false;
+    }
+
+    bool exists = false;
+    if (!json_extract_bool_field(response_body, "exists", &exists)) {
+        // 未匹配到 exists，按“无有效区域”处理，避免解析异常时阻塞主流程
+        cache_out->valid = false;
+        return true;
+    }
+    if (!exists) {
+        cache_out->valid = false;
+        return true;
+    }
+
+    int img_w = 0;
+    int img_h = 0;
+    (void)json_extract_int_field(response_body, "imageWidth", &img_w);
+    (void)json_extract_int_field(response_body, "imageHeight", &img_h);
+
+    std::vector<cv::Point2f> points;
+    if (!parse_points_from_forbidden_area_body(response_body, &points) || points.size() < 4) {
+        cache_out->valid = false;
+        if (err_msg) *err_msg = "points parse failed or less than 4";
+        return true;
+    }
+
+    if (points.size() > 4) {
+        points.resize(4);
+    }
+    cache_out->valid = true;
+    cache_out->image_width = img_w;
+    cache_out->image_height = img_h;
+    cache_out->points = points;
+    return true;
+}
+
+void refresh_forbidden_area_cache_if_needed(int cam_id) {
+    if (cam_id < 0 || cam_id > 1) return;
+
+    long long now_ms = monotonic_now_ms();
+    int interval_ms = g_forbidden_area_fetch_interval_ms.load();
+    if (interval_ms < 500) interval_ms = 500;
+
+    {
+        std::lock_guard<std::mutex> lock(g_forbidden_area_mutex);
+        if (g_forbidden_area_fetching[cam_id]) return;
+        if (now_ms - g_forbidden_area_cache[cam_id].last_fetch_ms < interval_ms) return;
+        g_forbidden_area_fetching[cam_id] = true;
+    }
+
+    ForbiddenAreaCache fetched;
+    std::string err_msg;
+    bool fetch_ok = fetch_forbidden_area_from_server(cam_id, &fetched, &err_msg);
+
+    static std::atomic<int> fetch_fail_counter[2];
+    {
+        std::lock_guard<std::mutex> lock(g_forbidden_area_mutex);
+        g_forbidden_area_fetching[cam_id] = false;
+        if (fetch_ok) {
+            g_forbidden_area_cache[cam_id] = fetched;
+            fetch_fail_counter[cam_id].store(0);
+        } else {
+            g_forbidden_area_cache[cam_id].last_fetch_ms = now_ms;
+            int fail_n = fetch_fail_counter[cam_id].fetch_add(1) + 1;
+            if (fail_n <= 3 || (fail_n % 60) == 0) {
+                printf("[ForbiddenArea] 拉取失败: cam=%d err=%s\n", cam_id, err_msg.c_str());
+            }
+        }
+    }
+}
+
+bool get_forbidden_area_polygon_for_frame(int cam_id, const cv::Size& frame_size, std::vector<cv::Point2f>* polygon_out) {
+    if (!polygon_out) return false;
+    polygon_out->clear();
+    if (cam_id < 0 || cam_id > 1) return false;
+    if (frame_size.width <= 0 || frame_size.height <= 0) return false;
+
+    ForbiddenAreaCache cache;
+    {
+        std::lock_guard<std::mutex> lock(g_forbidden_area_mutex);
+        cache = g_forbidden_area_cache[cam_id];
+    }
+    if (!cache.valid || cache.points.size() != 4) return false;
+
+    float sx = 1.0f;
+    float sy = 1.0f;
+    if (cache.image_width > 0) sx = (float)frame_size.width / (float)cache.image_width;
+    if (cache.image_height > 0) sy = (float)frame_size.height / (float)cache.image_height;
+
+    polygon_out->reserve(cache.points.size());
+    for (const auto& p : cache.points) {
+        float x = p.x * sx;
+        float y = p.y * sy;
+        if (x < 0.0f) x = 0.0f;
+        if (y < 0.0f) y = 0.0f;
+        if (x > (float)(frame_size.width - 1)) x = (float)(frame_size.width - 1);
+        if (y > (float)(frame_size.height - 1)) y = (float)(frame_size.height - 1);
+        polygon_out->push_back(cv::Point2f(x, y));
+    }
+    return polygon_out->size() == 4;
+}
+
+bool collect_intrusion_hits_for_frame(
+    int cam_id,
+    const cv::Size& frame_size,
+    const std::vector<DetectionResultItem>& detections,
+    std::vector<cv::Point2f>* polygon_out,
+    std::vector<DetectionResultItem>* hit_detections_out) {
+
+    if (!polygon_out || !hit_detections_out) return false;
+    polygon_out->clear();
+    hit_detections_out->clear();
+    if (cam_id < 0 || cam_id > 1) return false;
+    if (frame_size.width <= 0 || frame_size.height <= 0) return false;
+
+    if (!get_forbidden_area_polygon_for_frame(cam_id, frame_size, polygon_out)) {
+        return false;
+    }
+
+    for (const auto& det : detections) {
+        float cx = (det.x1 + det.x2) * 0.5f;
+        float cy = (det.y1 + det.y2) * 0.5f;
+        if (cv::pointPolygonTest(*polygon_out, cv::Point2f(cx, cy), false) >= 0.0) {
+            hit_detections_out->push_back(det);
+        }
+    }
+    return true;
+}
+
+void draw_forbidden_area_overlay_if_available(int cam_id, cv::Mat& frame_bgr) {
+    if (frame_bgr.empty()) return;
+    refresh_forbidden_area_cache_if_needed(cam_id);
+    std::vector<cv::Point2f> polygon;
+    if (!get_forbidden_area_polygon_for_frame(cam_id, frame_bgr.size(), &polygon)) return;
+
+    std::vector<cv::Point> poly_i;
+    poly_i.reserve(polygon.size());
+    for (const auto& p : polygon) {
+        poly_i.push_back(cv::Point((int)(p.x + 0.5f), (int)(p.y + 0.5f)));
+    }
+    if (poly_i.size() < 3) return;
+
+    const cv::Point* pts = poly_i.data();
+    int npts = (int)poly_i.size();
+    cv::polylines(frame_bgr, &pts, &npts, 1, true, cv::Scalar(0, 0, 255), 2);
+    for (const auto& p : poly_i) {
+        cv::circle(frame_bgr, p, 3, cv::Scalar(0, 0, 255), -1);
+    }
+}
+
+void draw_intrusion_boxes_overlay_if_needed(
+    int cam_id,
+    cv::Mat& frame_bgr,
+    const std::vector<DetectionResultItem>& detections) {
+
+    if (frame_bgr.empty()) return;
+    if (detections.empty()) return;
+
+    std::vector<cv::Point2f> polygon;
+    std::vector<DetectionResultItem> hits;
+    if (!collect_intrusion_hits_for_frame(cam_id, frame_bgr.size(), detections, &polygon, &hits)) return;
+    if (hits.empty()) return;
+
+    for (const auto& det : hits) {
+        int x1 = std::max(0, std::min((int)det.x1, frame_bgr.cols - 1));
+        int y1 = std::max(0, std::min((int)det.y1, frame_bgr.rows - 1));
+        int x2 = std::max(0, std::min((int)det.x2, frame_bgr.cols - 1));
+        int y2 = std::max(0, std::min((int)det.y2, frame_bgr.rows - 1));
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        cv::rectangle(frame_bgr, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 2);
+
+        std::string label = label_name_for_detection(det);
+        char text[192];
+        snprintf(text, sizeof(text), "INTR %s %.1f%%", label.c_str(), det.score * 100.0f);
+        int baseline = 0;
+        cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+        int tx = x1;
+        int ty = y1 - ts.height - baseline;
+        if (ty < 0) ty = 0;
+        if (tx + ts.width > frame_bgr.cols) tx = std::max(0, frame_bgr.cols - ts.width);
+        cv::rectangle(frame_bgr, cv::Rect(tx, ty, ts.width, ts.height + baseline), cv::Scalar(0, 0, 255), -1);
+        cv::putText(frame_bgr, text, cv::Point(tx, ty + ts.height),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+    }
+}
+
+std::vector<DetectionResultItem> build_detections_from_tracks(const std::vector<TrackerResultItem>& tracks) {
+    std::vector<DetectionResultItem> detections;
+    detections.reserve(tracks.size());
+    for (const auto& t : tracks) {
+        if (!t.active) continue;
+        DetectionResultItem d;
+        d.label = t.label;
+        d.score = t.score;
+        d.x1 = t.x1;
+        d.y1 = t.y1;
+        d.x2 = t.x2;
+        d.y2 = t.y2;
+        detections.push_back(d);
+    }
+    return detections;
+}
+
+std::string label_name_for_detection(const DetectionResultItem& det) {
+    if (det.label >= 0 && det.label < (int)coco_labels.size()) {
+        return coco_labels[det.label];
+    }
+    return "unknown";
+}
+
+void report_forbidden_area_intrusion_alert_worker(
+    int cam_id,
+    std::vector<DetectionResultItem> hit_detections,
+    std::vector<cv::Point2f> polygon,
+    cv::Mat frame_bgr) {
+
+    if (frame_bgr.empty()) return;
+    if (hit_detections.empty()) return;
+
+    std::vector<cv::Point> poly_i;
+    poly_i.reserve(polygon.size());
+    for (const auto& p : polygon) {
+        poly_i.push_back(cv::Point((int)(p.x + 0.5f), (int)(p.y + 0.5f)));
+    }
+    if (poly_i.size() >= 3) {
+        const cv::Point* pts = poly_i.data();
+        int npts = (int)poly_i.size();
+        cv::polylines(frame_bgr, &pts, &npts, 1, true, cv::Scalar(0, 0, 255), 3);
+    }
+    for (const auto& p : poly_i) {
+        cv::circle(frame_bgr, p, 4, cv::Scalar(0, 0, 255), -1);
+    }
+    for (const auto& det : hit_detections) {
+        int x1 = std::max(0, std::min((int)det.x1, frame_bgr.cols - 1));
+        int y1 = std::max(0, std::min((int)det.y1, frame_bgr.rows - 1));
+        int x2 = std::max(0, std::min((int)det.x2, frame_bgr.cols - 1));
+        int y2 = std::max(0, std::min((int)det.y2, frame_bgr.rows - 1));
+        if (x2 <= x1 || y2 <= y1) continue;
+        cv::rectangle(frame_bgr, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 0, 255), 2);
+    }
+
+    std::vector<uchar> jpg_buf;
+    if (!cv::imencode(".jpg", frame_bgr, jpg_buf, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+        printf("[IntrusionReport] JPEG 编码失败: cam=%d\n", cam_id);
+        return;
+    }
+    std::string image_b64 = base64_encode_bytes(jpg_buf.data(), jpg_buf.size());
+    int camera_id = (cam_id == 0) ? g_report_camera_id_cam0 : g_report_camera_id_cam1;
+
+    std::ostringstream detection_result;
+    detection_result << "{\"type\":\"env_intrusion\",\"cam\":" << cam_id
+                     << ",\"hitCount\":" << hit_detections.size()
+                     << ",\"zonePoints\":[";
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        if (i > 0) detection_result << ",";
+        detection_result << "{\"x\":" << (int)(polygon[i].x + 0.5f)
+                         << ",\"y\":" << (int)(polygon[i].y + 0.5f) << "}";
+    }
+    detection_result << "],\"objects\":[";
+    for (size_t i = 0; i < hit_detections.size(); ++i) {
+        const auto& det = hit_detections[i];
+        if (i > 0) detection_result << ",";
+        float cx = (det.x1 + det.x2) * 0.5f;
+        float cy = (det.y1 + det.y2) * 0.5f;
+        detection_result << "{\"label\":\"" << json_escape(label_name_for_detection(det)) << "\""
+                         << ",\"cls\":" << det.label
+                         << ",\"score\":" << std::fixed << std::setprecision(3) << det.score
+                         << ",\"center\":{\"x\":" << (int)(cx + 0.5f) << ",\"y\":" << (int)(cy + 0.5f) << "}"
+                         << ",\"box\":{\"x1\":" << (int)(det.x1 + 0.5f)
+                         << ",\"y1\":" << (int)(det.y1 + 0.5f)
+                         << ",\"x2\":" << (int)(det.x2 + 0.5f)
+                         << ",\"y2\":" << (int)(det.y2 + 0.5f) << "}}";
+    }
+    detection_result << "]}";
+
+    std::ostringstream body;
+    body << "{";
+    body << "\"cameraId\":" << camera_id << ",";
+    body << "\"detectionTime\":\"" << local_time_iso8601() << "\",";
+    body << "\"detectionResult\":\"" << json_escape(detection_result.str()) << "\",";
+    body << "\"imageBase64\":\"" << image_b64 << "\"";
+    body << "}";
+
+    std::string response_head;
+    bool ok = post_json_to_report_server(body.str(), &response_head);
+    if (ok) {
+        printf("[IntrusionReport] 上报成功: cam=%d cameraId=%d hit=%zu\n",
+               cam_id, camera_id, hit_detections.size());
+    } else {
+        std::string brief = response_head.empty() ? "(no response)" : response_head.substr(0, 120);
+        printf("[IntrusionReport] 上报失败: cam=%d cameraId=%d hit=%zu resp=%s\n",
+               cam_id, camera_id, hit_detections.size(), brief.c_str());
+    }
+}
+
+void report_forbidden_area_intrusion_alert_async(
+    int cam_id,
+    const std::vector<DetectionResultItem>& hit_detections,
+    const std::vector<cv::Point2f>& polygon,
+    const cv::Mat& frame_bgr) {
+
+    if (frame_bgr.empty() || hit_detections.empty()) return;
+    cv::Mat frame_copy = frame_bgr.clone();
+    if (frame_copy.empty()) return;
+    try {
+        std::thread(report_forbidden_area_intrusion_alert_worker, cam_id, hit_detections, polygon, frame_copy).detach();
+    } catch (...) {
+        printf("[IntrusionReport] 启动上报线程失败: cam=%d\n", cam_id);
+    }
+}
+
+void maybe_trigger_forbidden_area_intrusion_alert(
+    int cam_id,
+    const std::vector<DetectionResultItem>& detections,
+    const cv::Mat& frame_bgr) {
+
+    if (cam_id < 0 || cam_id > 1) return;
+    if (frame_bgr.empty()) return;
+
+    refresh_forbidden_area_cache_if_needed(cam_id);
+
+    std::vector<cv::Point2f> polygon;
+    std::vector<DetectionResultItem> hit_detections;
+    if (!collect_intrusion_hits_for_frame(cam_id, frame_bgr.size(), detections, &polygon, &hit_detections)) {
+        std::lock_guard<std::mutex> lock(g_intrusion_alert_state_mutex);
+        g_intrusion_over_state[cam_id] = false;
+        return;
+    }
+
+    bool intrusion = !hit_detections.empty();
+    bool should_report = false;
+    {
+        std::lock_guard<std::mutex> lock(g_intrusion_alert_state_mutex);
+        bool was_intrusion = g_intrusion_over_state[cam_id];
+        g_intrusion_over_state[cam_id] = intrusion;
+        if (!intrusion || was_intrusion) {
+            return;
+        }
+
+        long long now_ms = monotonic_now_ms();
+        int cooldown_ms = g_intrusion_alert_cooldown_ms.load();
+        if (cooldown_ms < 0) cooldown_ms = 0;
+        if (now_ms - g_last_intrusion_alert_ms[cam_id] < cooldown_ms) {
+            return;
+        }
+        g_last_intrusion_alert_ms[cam_id] = now_ms;
+        should_report = true;
+    }
+
+    if (should_report) {
+        report_forbidden_area_intrusion_alert_async(cam_id, hit_detections, polygon, frame_bgr);
+    }
 }
 
 std::string detect_model_path_locked() {
@@ -937,7 +1761,7 @@ void draw_tracker_boxes(cv::Mat& img, const std::vector<TrackerResultItem>& trac
                    track.track_id, label, x1, y1, x2, y2);
         }
 
-        cv::Scalar color = tracker_color_from_id(track.track_id);
+        cv::Scalar color = tracker_color_for_item(track.label, track.track_id);
         cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
 
         snprintf(text, sizeof(text), "ID:%d %s %.1f%%", track.track_id, label, track.score * 100.0f);
@@ -956,7 +1780,8 @@ void draw_tracker_boxes(cv::Mat& img, const std::vector<TrackerResultItem>& trac
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
 
         const auto& traj = track.trajectory;
-        int start_idx = (traj.size() > 20) ? ((int)traj.size() - 20) : 0;
+        const int draw_trail_points = get_track_draw_points_limit();
+        int start_idx = (traj.size() > (size_t)draw_trail_points) ? ((int)traj.size() - draw_trail_points) : 0;
         for (size_t j = (size_t)start_idx + 1; j < traj.size(); j++) {
             int px1 = std::max(0, std::min((int)traj[j - 1].first, img.cols - 1));
             int py1 = std::max(0, std::min((int)traj[j - 1].second, img.rows - 1));
@@ -1020,11 +1845,18 @@ void handle_client(int client_fd) {
         std::string tracker_backend = rknn_lite::get_tracker_backend_name();
         std::string tracker_reid_model = rknn_lite::resolve_tracker_reid_model();
         int tracker_skip_frames = rknn_lite::get_deepsort_skip_frames();
+        bool forbidden_cam0_loaded = false;
+        bool forbidden_cam1_loaded = false;
         {
             std::lock_guard<std::mutex> lock(g_model_mutex);
             model_path = g_model_path;
             label_path = g_label_path;
             model_error = g_model_error;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_forbidden_area_mutex);
+            forbidden_cam0_loaded = g_forbidden_area_cache[0].valid;
+            forbidden_cam1_loaded = g_forbidden_area_cache[1].valid;
         }
         std::string active_label_path = label_path.empty() ? DEFAULT_LABEL_PATH : label_path;
         std::ostringstream oss;
@@ -1052,6 +1884,14 @@ void handle_client(int client_fd) {
         oss << "\"detection_count_cam0\":" << g_cam0_detection_count.load() << ",";
         oss << "\"detection_count_cam1\":" << g_cam1_detection_count.load() << ",";
         oss << "\"threshold\":" << rknn_lite::get_detection_threshold() << ",";
+        oss << "\"box_count_alert_threshold\":" << g_box_count_alert_threshold.load() << ",";
+        oss << "\"box_count_alert_cooldown_ms\":" << g_box_count_alert_cooldown_ms.load() << ",";
+        oss << "\"forbidden_area_path\":\"" << json_escape(g_forbidden_area_path) << "\",";
+        oss << "\"forbidden_area_fetch_interval_ms\":" << g_forbidden_area_fetch_interval_ms.load() << ",";
+        oss << "\"forbidden_area_fetch_timeout_ms\":" << g_forbidden_area_fetch_timeout_ms.load() << ",";
+        oss << "\"intrusion_alert_cooldown_ms\":" << g_intrusion_alert_cooldown_ms.load() << ",";
+        oss << "\"forbidden_area_cam0_loaded\":" << (forbidden_cam0_loaded ? "true" : "false") << ",";
+        oss << "\"forbidden_area_cam1_loaded\":" << (forbidden_cam1_loaded ? "true" : "false") << ",";
         oss << "\"video_mode\":" << (g_video_mode ? "true" : "false");
 #ifdef USE_RTSP_MPP
         oss << ",\"rtsp_streaming\":" << (g_rtsp_streaming ? "true" : "false");
@@ -1062,23 +1902,58 @@ void handle_client(int client_fd) {
         send_response(client_fd, oss.str(), "application/json");
     }
     else if (route == "/api/threshold/set" && method == "POST") {
-        // 设置检测阈值: /api/threshold/set?value=0.6
-        float value = 0.5f;
-        size_t pos = path.find("value=");
-        if (pos != std::string::npos) {
-            value = std::stof(path.substr(pos + 6));
+        // 设置检测阈值: /api/threshold/set?value=0.6&box_count=3
+        float value = rknn_lite::get_detection_threshold();
+        std::string value_text = parse_query_param(path, "value");
+        if (!value_text.empty()) {
+            try {
+                value = std::stof(value_text);
+            } catch (...) {
+                send_response(client_fd,
+                    build_json_response("error", "无效的 value 参数，必须是 0~1 浮点数"),
+                    "application/json", 400);
+                return;
+            }
         }
         if (value < 0.0f) value = 0.0f;
         if (value > 1.0f) value = 1.0f;
         g_confidence_threshold.store(value);
         rknn_lite::set_detection_threshold(value);
-        send_response(client_fd, build_json_response("success",
-            "阈值已设置为: " + std::to_string(value)), "application/json");
+
+        bool has_box_count_param =
+            (path.find("box_count=") != std::string::npos) ||
+            (path.find("boxCount=") != std::string::npos);
+        if (has_box_count_param) {
+            std::string box_count_text = parse_query_param(path, "box_count");
+            if (box_count_text.empty()) {
+                box_count_text = parse_query_param(path, "boxCount");
+            }
+            char* endptr = nullptr;
+            long parsed = strtol(box_count_text.c_str(), &endptr, 10);
+            if (box_count_text.empty() || endptr == box_count_text.c_str() || *endptr != '\0' || parsed < 0) {
+                send_response(client_fd,
+                    build_json_response("error", "无效的 box_count 参数，必须是大于等于 0 的整数"),
+                    "application/json", 400);
+                return;
+            }
+            if (parsed > 10000) parsed = 10000;
+            g_box_count_alert_threshold.store((int)parsed);
+        }
+
+        std::ostringstream msg;
+        msg << "阈值已设置为: " << value;
+        if (has_box_count_param) {
+            msg << ", 框数量阈值: " << g_box_count_alert_threshold.load();
+        }
+        send_response(client_fd, build_json_response("success", msg.str()), "application/json");
     }
     else if (route == "/api/threshold/get" && method == "GET") {
-        // 获取当前阈值
+        // 获取当前阈值（置信度 + 框数量告警阈值）
         std::ostringstream oss;
-        oss << "{\"threshold\":" << rknn_lite::get_detection_threshold() << "}";
+        oss << "{";
+        oss << "\"threshold\":" << rknn_lite::get_detection_threshold() << ",";
+        oss << "\"box_count_threshold\":" << g_box_count_alert_threshold.load();
+        oss << "}";
         send_response(client_fd, oss.str(), "application/json");
     }
     else if (route == "/api/detection/count" && method == "GET") {
@@ -1096,7 +1971,7 @@ void handle_client(int client_fd) {
         send_response(client_fd, oss.str(), "application/json");
     }
     else if (route == "/api/frame" && method == "GET") {
-        // 解析参数: /api/frame?track=1&redraw=1
+        // 解析参数: /api/frame?track=1&redraw=1&cam=0
         bool want_tracker = g_tracker_enabled.load();
         if (path.find("track=1") != std::string::npos || path.find("track=ON") != std::string::npos) {
             want_tracker = true;
@@ -1105,11 +1980,39 @@ void handle_client(int client_fd) {
         }
         // 默认不二次绘制：推理线程已经在 ori_img 上画过框，二次叠加会出现“一人双框”
         bool force_redraw = (path.find("redraw=1") != std::string::npos || path.find("overlay=1") != std::string::npos);
+        int requested_cam = -1;
+        std::string cam_text = parse_query_param(path, "cam");
+        if (!cam_text.empty()) {
+            char* endptr = nullptr;
+            long parsed = strtol(cam_text.c_str(), &endptr, 10);
+            if (endptr != cam_text.c_str() && *endptr == '\0' && parsed >= 0 && parsed <= 1) {
+                requested_cam = (int)parsed;
+            }
+        }
+        if (requested_cam < 0) {
+            std::string camera_id_text = parse_query_param(path, "cameraId");
+            if (!camera_id_text.empty()) {
+                char* endptr = nullptr;
+                long camera_id = strtol(camera_id_text.c_str(), &endptr, 10);
+                if (endptr != camera_id_text.c_str() && *endptr == '\0') {
+                    if (camera_id == 1) requested_cam = 0;
+                    else if (camera_id == 2) requested_cam = 1;
+                }
+            }
+        }
         
         cv::Mat frame_copy;
         bool available = false;
         int frame_slot = -1;
-        {
+        if (requested_cam >= 0 && requested_cam <= 1) {
+            std::lock_guard<std::mutex> lock(g_latest_frame_cam_mutex[requested_cam]);
+            if (!g_latest_frame_cam[requested_cam].empty()) {
+                frame_copy = g_latest_frame_cam[requested_cam].clone();
+                available = true;
+                frame_slot = g_latest_frame_slot_cam[requested_cam];
+            }
+        }
+        if (!available) {
             std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
             if (!g_latest_frame.empty()) {
                 frame_copy = g_latest_frame.clone();
@@ -1786,6 +2689,16 @@ int main(int argc, char** argv) {
     const char* env_rtsp_prebind_dma = getenv("RTSP_PREBIND_DMA");
     const char* env_tracker_backend = getenv("TRACKER_BACKEND");
     const char* env_tracker_reid = getenv("TRACKER_REID_MODEL");
+    const char* env_report_host = getenv("REPORT_SERVER_HOST");
+    const char* env_report_port = getenv("REPORT_SERVER_PORT");
+    const char* env_report_path = getenv("REPORT_SERVER_PATH");
+    const char* env_report_cam0_id = getenv("REPORT_CAM0_ID");
+    const char* env_report_cam1_id = getenv("REPORT_CAM1_ID");
+    const char* env_box_alert_cooldown = getenv("BOX_ALERT_COOLDOWN_MS");
+    const char* env_forbidden_area_path = getenv("FORBIDDEN_AREA_PATH");
+    const char* env_forbidden_area_sync_ms = getenv("FORBIDDEN_AREA_SYNC_MS");
+    const char* env_forbidden_area_timeout_ms = getenv("FORBIDDEN_AREA_TIMEOUT_MS");
+    const char* env_intrusion_alert_cooldown = getenv("INTRUSION_ALERT_COOLDOWN_MS");
     bool rtsp_prebind_dma = false;
     if (env_rtsp_host && *env_rtsp_host) {
         g_rtsp_host = env_rtsp_host;
@@ -1806,6 +2719,47 @@ int main(int argc, char** argv) {
     }
     if (env_tracker_reid && *env_tracker_reid) {
         rknn_lite::set_tracker_reid_model_override(env_tracker_reid);
+    }
+    if (env_report_host && *env_report_host) {
+        g_report_server_host = env_report_host;
+    }
+    if (env_report_port && *env_report_port) {
+        int p = atoi(env_report_port);
+        if (p > 0 && p <= 65535) g_report_server_port = p;
+    }
+    if (env_report_path && *env_report_path) {
+        g_report_server_path = env_report_path;
+        if (!g_report_server_path.empty() && g_report_server_path[0] != '/') {
+            g_report_server_path = "/" + g_report_server_path;
+        }
+    }
+    if (env_report_cam0_id && *env_report_cam0_id) {
+        g_report_camera_id_cam0 = atoi(env_report_cam0_id);
+    }
+    if (env_report_cam1_id && *env_report_cam1_id) {
+        g_report_camera_id_cam1 = atoi(env_report_cam1_id);
+    }
+    if (env_box_alert_cooldown && *env_box_alert_cooldown) {
+        int cooldown = atoi(env_box_alert_cooldown);
+        if (cooldown >= 0) g_box_count_alert_cooldown_ms.store(cooldown);
+    }
+    if (env_forbidden_area_path && *env_forbidden_area_path) {
+        g_forbidden_area_path = env_forbidden_area_path;
+        if (!g_forbidden_area_path.empty() && g_forbidden_area_path[0] != '/') {
+            g_forbidden_area_path = "/" + g_forbidden_area_path;
+        }
+    }
+    if (env_forbidden_area_sync_ms && *env_forbidden_area_sync_ms) {
+        int v = atoi(env_forbidden_area_sync_ms);
+        if (v > 0) g_forbidden_area_fetch_interval_ms.store(v);
+    }
+    if (env_forbidden_area_timeout_ms && *env_forbidden_area_timeout_ms) {
+        int v = atoi(env_forbidden_area_timeout_ms);
+        if (v > 0) g_forbidden_area_fetch_timeout_ms.store(v);
+    }
+    if (env_intrusion_alert_cooldown && *env_intrusion_alert_cooldown) {
+        int v = atoi(env_intrusion_alert_cooldown);
+        if (v >= 0) g_intrusion_alert_cooldown_ms.store(v);
     }
 
     // 解析命令行参数
@@ -1839,6 +2793,14 @@ int main(int argc, char** argv) {
     printf("[Tracker] 默认算法: %s | ReID: %s\n",
            rknn_lite::get_tracker_backend_name().c_str(),
            rknn_lite::resolve_tracker_reid_model().empty() ? "(none)" : rknn_lite::resolve_tracker_reid_model().c_str());
+    printf("[AlertReport] 目标: http://%s:%d%s | cam0->%d cam1->%d | cooldown=%dms\n",
+           g_report_server_host.c_str(), g_report_server_port, g_report_server_path.c_str(),
+           g_report_camera_id_cam0, g_report_camera_id_cam1, g_box_count_alert_cooldown_ms.load());
+    printf("[ForbiddenArea] 拉取: http://%s:%d%s | interval=%dms timeout=%dms | intrusion_cooldown=%dms\n",
+           g_report_server_host.c_str(), g_report_server_port, g_forbidden_area_path.c_str(),
+           g_forbidden_area_fetch_interval_ms.load(),
+           g_forbidden_area_fetch_timeout_ms.load(),
+           g_intrusion_alert_cooldown_ms.load());
     
     // 初始化 slot 容器，模型在 /api/inference/on 时懒加载
     int total_slots = SLOTS_PER_CAM * 2;
@@ -1927,6 +2889,9 @@ int main(int argc, char** argv) {
     std::thread http_thread(http_server_thread);
     // 启动 CPU/NPU 使用率监控（每 10s 打印均值）
     std::thread usage_thread(usage_monitor_loop);
+
+    refresh_forbidden_area_cache_if_needed(0);
+    refresh_forbidden_area_cache_if_needed(1);
     
     printf("[Main] 流水线已启动\n");
     
@@ -1959,15 +2924,12 @@ int main(int argc, char** argv) {
                     if (read_camera_frame(&dmabuf_cap0, &cap0, &raw0) && !raw0.empty()) {
                         got_frame = true;
                         frames0++;
-                        {
-                            std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
-                            g_latest_frame = raw0.clone();
-                            g_frame_available = true;
-                            g_latest_frame_slot = 0;
-                        }
+                        update_latest_frame_global(raw0, 0);
+                        update_latest_frame_for_cam(0, raw0, 0);
                         {
                             std::lock_guard<std::mutex> rtsp_lock(g_rtsp_mutex);
                             if (g_rtsp_sender0 && g_rtsp_sender0->inited()) {
+                                draw_rtsp_fps_overlay(raw0, g_rtsp_cam0_fps.load());
                                 if (g_rtsp_sender0->push(raw0)) {
                                     push0++;
                                 } else {
@@ -1984,15 +2946,12 @@ int main(int argc, char** argv) {
                     if (read_camera_frame(&dmabuf_cap1, &cap1, &raw1) && !raw1.empty()) {
                         got_frame = true;
                         frames1++;
-                        {
-                            std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
-                            g_latest_frame = raw1.clone();
-                            g_frame_available = true;
-                            g_latest_frame_slot = SLOTS_PER_CAM;
-                        }
+                        update_latest_frame_global(raw1, SLOTS_PER_CAM);
+                        update_latest_frame_for_cam(1, raw1, SLOTS_PER_CAM);
                         {
                             std::lock_guard<std::mutex> rtsp_lock(g_rtsp_mutex);
                             if (g_rtsp_sender1 && g_rtsp_sender1->inited()) {
+                                draw_rtsp_fps_overlay(raw1, g_rtsp_cam1_fps.load());
                                 if (g_rtsp_sender1->push(raw1)) {
                                     push1++;
                                 } else {
@@ -2014,6 +2973,9 @@ int main(int argc, char** argv) {
                     float elapsed = (now_ms - last_fps_time_ms) / 1000.0f;
                     g_cam0_fps.store((int)(frames0 / elapsed));
                     g_cam1_fps.store((int)(frames1 / elapsed));
+                    g_rtsp_cam0_fps.store((int)(push0 / elapsed));
+                    g_rtsp_cam1_fps.store((int)(push1 / elapsed));
+                    g_rtsp_video_fps.store(0);
                     if (push0 > 0 || push1 > 0) {
                         printf("[FPS-RAW] Cam0: %d FPS | Cam1: %d FPS | RTSP: %d | %d\n",
                                g_cam0_fps.load(), g_cam1_fps.load(), push0, push1);
@@ -2029,6 +2991,9 @@ int main(int argc, char** argv) {
 #endif
             g_cam0_fps.store(0);
             g_cam1_fps.store(0);
+            g_rtsp_cam0_fps.store(0);
+            g_rtsp_cam1_fps.store(0);
+            g_rtsp_video_fps.store(0);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -2043,16 +3008,29 @@ int main(int argc, char** argv) {
             if (slot_states[i].ready.load()) {
                 any_done = true;
                 cv::Mat worker_frame;
+                std::vector<DetectionResultItem> frame_detections;
                 {
                     std::lock_guard<std::mutex> lock(g_model_mutex);
                     if (i < (int)rkpool.size() && rkpool[i]) {
                         worker_frame = rkpool[i]->ori_img;  // shallow copy: avoid clone in hot path
+                        if (g_inference_enabled.load()) {
+                            frame_detections = rkpool[i]->get_last_detections();
+                            if (frame_detections.empty()) {
+                                auto tracks = rkpool[i]->get_last_tracks();
+                                if (!tracks.empty()) {
+                                    frame_detections = build_detections_from_tracks(tracks);
+                                }
+                            }
+                        }
                     }
                 }
                 if (worker_frame.empty()) {
                     slot_states[i].ready.store(false);
                     continue;
                 }
+
+                draw_forbidden_area_overlay_if_available(cam, worker_frame);
+                draw_intrusion_boxes_overlay_if_needed(cam, worker_frame, frame_detections);
                 
                 // 更新最新帧（供 HTTP API 获取）
                 // 视频模式只用 slot 0，摄像头模式用各自摄像头
@@ -2064,16 +3042,20 @@ int main(int argc, char** argv) {
                 }
                 
                 if (should_update_frame) {
-                    std::lock_guard<std::mutex> lock(g_latest_frame_mutex);
-                    g_latest_frame = worker_frame.clone();
-                    g_frame_available = true;
-                    g_latest_frame_slot = i;
+                    update_latest_frame_global(worker_frame, i);
+                    if (!g_video_mode.load() && cam >= 0 && cam <= 1) {
+                        update_latest_frame_for_cam(cam, worker_frame, i);
+                    }
                 }
                 
                 // RTSP 推流（绘制跟踪框）
 #ifdef USE_RTSP_MPP
                 if (g_rtsp_streaming.load()) {
                     cv::Mat frame_for_rtsp = worker_frame;  // shallow copy: avoid clone in hot path
+                    int rtsp_fps_text = g_video_mode.load()
+                        ? g_rtsp_video_fps.load()
+                        : ((cam == 0) ? g_rtsp_cam0_fps.load() : g_rtsp_cam1_fps.load());
+                    draw_rtsp_fps_overlay(frame_for_rtsp, rtsp_fps_text);
 
                     bool use_tracker = g_tracker_enabled.load();
                     if (use_tracker) {
@@ -2323,20 +3305,35 @@ int main(int argc, char** argv) {
                     // 更新图像尺寸（用于绘制）
                     g_current_img_size = img_size;
 
-                    // 更新对应摄像头的检测数量
-                    if (cam_id == 0) {
-                        g_cam0_detection_count = rknn_lite::last_detection_count.load();
-                    } else {
-                        g_cam1_detection_count = rknn_lite::last_detection_count.load();
-                    }
-
-                    // 如果启用了跟踪，保存跟踪结果
-                    if (use_tracker) {
-                        std::lock_guard<std::mutex> lock(g_tracker_mutex);
-                        auto tracks = worker->get_last_tracks();
-                        if (i < (int)g_tracker_results.size()) {
-                            g_tracker_results[i] = tracks;
+                    if (do_inference) {
+                        // 更新对应摄像头的检测数量
+                        int detection_count = worker->get_last_detection_count();
+                        if (cam_id == 0) {
+                            g_cam0_detection_count = detection_count;
+                        } else {
+                            g_cam1_detection_count = detection_count;
                         }
+
+                        // 框数量超过阈值时主动上报（带当前帧截图）
+                        maybe_trigger_detection_count_alert(cam_id, detection_count, worker->ori_img);
+
+                        auto tracks = worker->get_last_tracks();
+                        auto detections = worker->get_last_detections();
+                        if (detections.empty() && !tracks.empty()) {
+                            detections = build_detections_from_tracks(tracks);
+                        }
+                        maybe_trigger_forbidden_area_intrusion_alert(cam_id, detections, worker->ori_img);
+
+                        // 如果启用了跟踪，保存跟踪结果
+                        if (use_tracker) {
+                            std::lock_guard<std::mutex> lock(g_tracker_mutex);
+                            if (i < (int)g_tracker_results.size()) {
+                                g_tracker_results[i] = tracks;
+                            }
+                        }
+                    } else {
+                        if (cam_id == 0) g_cam0_detection_count = 0;
+                        else g_cam1_detection_count = 0;
                     }
 
                     // 仅在线程所有输出都写完后再标记 ready，避免主线程过早复用 slot
@@ -2367,6 +3364,15 @@ int main(int argc, char** argv) {
             float elapsed = (now_ms - last_fps_time_ms) / 1000.0f;
             g_cam0_fps.store((int)(frames0 / elapsed));
             g_cam1_fps.store((int)(frames1 / elapsed));
+            if (g_video_mode.load()) {
+                g_rtsp_video_fps.store((int)(push0 / elapsed));
+                g_rtsp_cam0_fps.store(0);
+                g_rtsp_cam1_fps.store(0);
+            } else {
+                g_rtsp_cam0_fps.store((int)(push0 / elapsed));
+                g_rtsp_cam1_fps.store((int)(push1 / elapsed));
+                g_rtsp_video_fps.store(0);
+            }
             
 #ifdef USE_RTSP_MPP
             if (g_rtsp_streaming.load() && (push0 > 0 || push1 > 0)) {
